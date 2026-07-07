@@ -2,18 +2,18 @@
 """
 Chakra report HTTP service.
 
-Two ways to use it:
+Designed so n8n needs NO code nodes and NO state of its own.
+The VPS remembers the last uploaded file per Telegram chat.
 
-1) One-shot (file + name in a single request):
-   POST /report   multipart: file=<xlsx>, name=<str>  -> returns PDF
+Endpoints:
+  GET  /health
+  POST /report   file=<xlsx>, name=<str>            -> PDF   (one-shot, optional)
+  POST /upload   file=<xlsx>, chat=<chat_id>         -> {ok}  (stash by chat)
+  POST /render   chat=<chat_id>, name=<str>          -> PDF   (render stashed file)
 
-2) Two-step (lets the Telegram bot ask for the name in a separate message):
-   POST /upload   multipart: file=<xlsx>              -> {"id": "<token>"}
-   POST /render   json/form: id=<token>, name=<str>   -> returns PDF
-
-Uploaded files are held in a temp dir and auto-expire after UPLOAD_TTL seconds.
+Pending uploads live in a temp dir, one slot per chat, auto-expire after TTL.
 """
-import os, tempfile, json, traceback, re, time, uuid, threading
+import os, tempfile, json, traceback, re, time
 from flask import Flask, request, send_file, jsonify
 
 import nazarban_service as svc
@@ -21,17 +21,23 @@ import nazarban_service as svc
 app = Flask(__name__)
 TOKEN = os.environ.get('NAZARBAN_TOKEN', '')
 
-# where pending uploads live between /upload and /render
 STORE_DIR = os.path.join(tempfile.gettempdir(), 'chakra_uploads')
 os.makedirs(STORE_DIR, exist_ok=True)
-UPLOAD_TTL = 1800  # 30 minutes
+UPLOAD_TTL = 1800  # 30 min
+
+def _auth_ok():
+    return (not TOKEN) or (request.headers.get('X-Auth-Token') == TOKEN)
 
 def _safe_name(name):
     safe = re.sub(r'[^\w\u0600-\u06FF\- ]', '', name).strip() if name else ''
     safe = re.sub(r'\s+', '_', safe)
     return f"{safe}.pdf" if safe else "chakra-report.pdf"
 
-def _render_pdf_response(in_path, name, date=''):
+def _chat_key(chat):
+    # only allow digits / minus (telegram chat ids) to build a safe filename
+    return re.sub(r'[^0-9\-]', '', str(chat))
+
+def _render_response(in_path, name, date=''):
     td = tempfile.mkdtemp()
     out_path = os.path.join(td, 'out.pdf')
     data = svc.score_workbook(in_path)
@@ -45,8 +51,7 @@ def _render_pdf_response(in_path, name, date=''):
     resp.headers['X-Archetype'] = data['archetype']
     return resp
 
-def _sweep_old():
-    """Delete pending uploads older than the TTL."""
+def _sweep():
     now = time.time()
     for f in os.listdir(STORE_DIR):
         p = os.path.join(STORE_DIR, f)
@@ -56,14 +61,10 @@ def _sweep_old():
         except OSError:
             pass
 
-def _auth_ok():
-    return (not TOKEN) or (request.headers.get('X-Auth-Token') == TOKEN)
-
 @app.route('/health')
 def health():
     return jsonify(ok=True, service='chakra-report')
 
-# --- one-shot (kept for convenience / backward compat) ---
 @app.route('/report', methods=['POST'])
 def report():
     if not _auth_ok():
@@ -71,51 +72,46 @@ def report():
     if 'file' not in request.files:
         return jsonify(ok=False, error='no file field'), 400
     name = request.form.get('name', '')
-    date = request.form.get('date', '')
     with tempfile.TemporaryDirectory() as td:
         in_path = os.path.join(td, 'in.xlsx')
         request.files['file'].save(in_path)
         try:
-            return _render_pdf_response(in_path, name, date)
+            return _render_response(in_path, name)
         except Exception as e:
             return jsonify(ok=False, error=str(e), trace=traceback.format_exc()), 500
 
-# --- step 1: stash the uploaded file, return an id ---
 @app.route('/upload', methods=['POST'])
 def upload():
     if not _auth_ok():
         return jsonify(ok=False, error='unauthorized'), 401
     if 'file' not in request.files:
         return jsonify(ok=False, error='no file field'), 400
-    _sweep_old()
-    fid = uuid.uuid4().hex
-    path = os.path.join(STORE_DIR, fid + '.xlsx')
+    chat = _chat_key(request.form.get('chat', ''))
+    if not chat:
+        return jsonify(ok=False, error='no chat id'), 400
+    _sweep()
+    path = os.path.join(STORE_DIR, 'chat_' + chat + '.xlsx')
     request.files['file'].save(path)
-    return jsonify(ok=True, id=fid)
+    return jsonify(ok=True, chat=chat)
 
-# --- step 2: render the stashed file with the provided name ---
 @app.route('/render', methods=['POST'])
 def render():
     if not _auth_ok():
         return jsonify(ok=False, error='unauthorized'), 401
     body = request.get_json(silent=True) or {}
-    fid = (request.form.get('id') or body.get('id') or '').strip()
+    chat = _chat_key(request.form.get('chat') or body.get('chat') or '')
     name = (request.form.get('name') or body.get('name') or '').strip()
-    date = (request.form.get('date') or body.get('date') or '').strip()
-    if not fid:
-        return jsonify(ok=False, error='no id'), 400
-    # guard against path tricks
-    if not re.fullmatch(r'[0-9a-f]{32}', fid):
-        return jsonify(ok=False, error='bad id'), 400
-    path = os.path.join(STORE_DIR, fid + '.xlsx')
+    if not chat:
+        return jsonify(ok=False, error='no chat id'), 400
+    path = os.path.join(STORE_DIR, 'chat_' + chat + '.xlsx')
     if not os.path.exists(path):
-        return jsonify(ok=False, error='file expired or not found'), 404
+        return jsonify(ok=False, error='no pending file for this chat'), 404
     try:
-        resp = _render_pdf_response(path, name, date)
+        resp = _render_response(path, name)
     except Exception as e:
         return jsonify(ok=False, error=str(e), trace=traceback.format_exc()), 500
     finally:
-        try: os.remove(path)   # one-time use
+        try: os.remove(path)
         except OSError: pass
     return resp
 
