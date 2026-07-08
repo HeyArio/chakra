@@ -3,13 +3,19 @@
 Usage: python3 nazarban_service.py <input_xlsx> <output_pdf> [person_name] [date_str]
 """
 import sys, os, json, math, html, statistics
+from typing import Optional
 import openpyxl, warnings
+from openpyxl.utils import column_index_from_string
 from playwright.sync_api import sync_playwright
 warnings.filterwarnings('ignore')
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-def _load_fonts():
-    return json.load(open(os.path.join(_HERE, 'fonts_b64.json')))
+TOTAL_QUESTIONS = 140
+
+def _load_fonts() -> dict:
+    path = os.path.join(_HERE, 'fonts_b64.json')
+    with open(path) as f:
+        return json.load(f)
 
 # ===== scoring engine =====
 
@@ -22,12 +28,17 @@ WEIGHT_COLS = {
 }
 CHAKRA_KEYS = ['root', 'sacral', 'solar', 'heart', 'throat', 'thirdeye', 'crown']
 
-FA = {  # English key -> Persian label used in the report
+# Canonical Persian labels — single source of truth for all chakra/index names
+CHAKRA_LABEL = {
     'root': 'ریشه', 'sacral': 'خاجی', 'solar': 'خورشیدی', 'heart': 'قلب',
     'throat': 'گلو', 'thirdeye': 'چشم سوم', 'crown': 'تاج',
+}
+INDEX_LABEL = {
     'financial': 'مالی', 'emotional': 'عاطفی', 'health': 'سلامت',
     'receptivity': 'دریافت', 'intuition': 'شهود',
 }
+FA = {**CHAKRA_LABEL, **INDEX_LABEL}
+
 # Chakra -> archetype (from the client's Archetypes sheet)
 ARCHETYPE = {
     'root': 'Builder', 'sacral': 'Creator', 'solar': 'Leader', 'heart': 'Healer',
@@ -38,13 +49,7 @@ ARCHETYPE_FA = {
     'Messenger': 'پیام‌رسان', 'Visionary': 'بینا', 'Mystic': 'عارف',
 }
 
-def col_to_idx(letter):
-    idx = 0
-    for ch in letter:
-        idx = idx * 26 + (ord(ch) - ord('A') + 1)
-    return idx
-
-def level_band(score):
+def level_band(score: Optional[float]) -> tuple[str, str]:
     """Client's IF bands from Calculations!D column."""
     if score is None:
         return ('', '')
@@ -53,22 +58,22 @@ def level_band(score):
     if score < 75:  return ('متعادل نسبی',        'moderate')
     return ('نقطه قوت', 'strength')
 
-def score_workbook(path):
+def score_workbook(path: str) -> dict:
     wb = openpyxl.load_workbook(path, data_only=True)
     q = wb['Questions']
     r = wb['Responses']
 
     # answers: row 2..141 -> int 1..4 (blank allowed)
     answers = []
-    for row in range(2, 142):
+    for row in range(2, TOTAL_QUESTIONS + 2):
         v = r.cell(row, 2).value
         answers.append(int(v) if v not in (None, '') else None)
 
     # weights per metric (row-aligned with answers)
     weights = {}
     for key, letter in WEIGHT_COLS.items():
-        ci = col_to_idx(letter)
-        weights[key] = [q.cell(row, ci).value or 0 for row in range(2, 142)]
+        ci = column_index_from_string(letter)
+        weights[key] = [q.cell(row, ci).value or 0 for row in range(2, TOTAL_QUESTIONS + 2)]
 
     def metric_score(key):
         # client's formula:
@@ -89,7 +94,7 @@ def score_workbook(path):
 
     # completion / confidence
     answered = sum(1 for a in answers if a is not None)
-    confidence = round(answered / 140 * 100, 1)
+    confidence = round(answered / TOTAL_QUESTIONS * 100, 1)
 
     # overall balance = 100 - population stdev of 7 chakra scores
     chakra_vals = [scores[k] for k in CHAKRA_KEYS if scores[k] is not None]
@@ -157,11 +162,9 @@ BAND_LABEL = {
     'moderate':'متعادل نسبی','strength':'نقطه قوت',
 }
 
-def _radar_svg(chakras):
+def _radar_svg(chakras: dict) -> str:
     """7-axis radar, restyled: dotted rings, gradient fill. Persian labels outside."""
     keys = ['crown','thirdeye','throat','heart','solar','sacral','root']
-    labels = {'root':'ریشه','sacral':'خاجی','solar':'خورشیدی','heart':'قلب',
-              'throat':'گلو','thirdeye':'چشم سوم','crown':'تاج'}
     cx, cy, R = 210, 205, 150
     n = 7
     def pt(i, r):
@@ -176,7 +179,7 @@ def _radar_svg(chakras):
         x,y = pt(i,R)
         spokes += f'<line x1="{cx}" y1="{cy}" x2="{x:.1f}" y2="{y:.1f}" stroke="#ffffff" stroke-opacity="0.08"/>'
         lx,ly = pt(i,R+26)
-        labs += f'<text x="{lx:.1f}" y="{ly:.1f}" fill="#b9afce" font-size="13" text-anchor="middle" dominant-baseline="middle">{labels[k]}</text>'
+        labs += f'<text x="{lx:.1f}" y="{ly:.1f}" fill="#b9afce" font-size="13" text-anchor="middle" dominant-baseline="middle">{CHAKRA_LABEL[k]}</text>'
     dpts=[]
     for i,k in enumerate(keys):
         v=(chakras.get(k) or 0)/100
@@ -193,10 +196,8 @@ def _radar_svg(chakras):
       {dots}{labs}
     </svg>'''
 
-def _spine(chakras):
+def _spine(chakras: dict) -> str:
     """Signature element: vertical stack of 7 luminous bars = the energy spine."""
-    labels={'root':'ریشه','sacral':'خاجی','solar':'خورشیدی','heart':'قلب',
-            'throat':'گلو','thirdeye':'چشم سوم','crown':'تاج'}
     rows=''
     for k in CHAKRA_ORDER:
         v=chakras.get(k) or 0
@@ -205,11 +206,11 @@ def _spine(chakras):
           <div class="spine-num">{v:.0f}</div>
           <div class="spine-track"><div class="spine-fill" style="width:{v:.0f}%;background:{c};box-shadow:0 0 10px {c}88"></div></div>
           <div class="spine-dot" style="background:{c};box-shadow:0 0 8px {c}"></div>
-          <div class="spine-label">{labels[k]}</div>
+          <div class="spine-label">{CHAKRA_LABEL[k]}</div>
         </div>'''
     return f'<div class="spine">{rows}</div>'
 
-def _bars(metrics, keys, labelmap):
+def _bars(metrics: dict, keys: list, labelmap: dict) -> str:
     out=''
     for k in keys:
         m=metrics[k]; v=m['score'] or 0
@@ -221,11 +222,27 @@ def _bars(metrics, keys, labelmap):
         </div>'''
     return out
 
-def build_html(data, fonts_b64, person_name='', date_str=''):
+def _interp_rows(metrics: dict, labelmap: dict) -> str:
+    """Build per-chakra interpretation rows HTML."""
+    parts = []
+    for k in CHAKRA_ORDER:
+        m = metrics[k]
+        score = m['score'] or 0
+        color = CHAKRA_COLOR[k]
+        parts.append(
+            f'<div class="interp-row" style="border-color:{color}">'
+            f'<div class="t"><span>{labelmap[k]}</span>'
+            f'<span style="color:{color}">{score:.0f}% · {BAND_LABEL[m["level"]]}</span></div>'
+            f'<div class="s">{BAND_SUGGEST[m["level"]]}</div>'
+            f'</div>'
+        )
+    return ''.join(parts)
+
+def build_html(data: dict, fonts_b64: dict, person_name: str = '', date_str: str = '') -> str:
     m=data['metrics']
     chak=data['chakras']
-    idxlab={'financial':'مالی','emotional':'عاطفی','health':'سلامت','receptivity':'دریافت','intuition':'شهود'}
-    chaklab={'root':'ریشه','sacral':'خاجی','solar':'خورشیدی','heart':'قلب','throat':'گلو','thirdeye':'چشم سوم','crown':'تاج'}
+    chaklab = CHAKRA_LABEL
+    idxlab = INDEX_LABEL
     arche=data['archetype']; arche_fa=data['archetype_fa']
     pos,shadow=ARCHE_DESC.get(arche,('',''))
     dom=data['dominant']; dom_fa=data['dominant_fa']
@@ -421,10 +438,7 @@ html,body{{font-family:'Vazir',sans-serif;color:#F4EEFA;background:#0f0b18;-webk
 
   <div class="sec">
     <div class="sec-h"><span class="sec-n">۰۵</span><span class="sec-t">تفسیر و پیشنهاد هر مرکز</span><span class="sec-line"></span></div>
-    <div>{''.join(f'''<div class="interp-row" style="border-color:{CHAKRA_COLOR[k]}">
-        <div class="t"><span>{chaklab[k]}</span><span style="color:{CHAKRA_COLOR[k]}">{m[k]['score']:.0f}٪ · {BAND_LABEL[m[k]['level']]}</span></div>
-        <div class="s">{BAND_SUGGEST[m[k]['level']]}</div>
-      </div>''' for k in ['crown','thirdeye','throat','heart','solar','sacral','root'])}</div>
+    <div>{_interp_rows(m, chaklab)}</div>
   </div>
 
   <div class="foot">
@@ -437,7 +451,7 @@ html,body{{font-family:'Vazir',sans-serif;color:#F4EEFA;background:#0f0b18;-webk
 
 
 # ===== renderer =====
-def render_html_to_pdf(html_str, pdf_path):
+def render_html_to_pdf(html_str: str, pdf_path: str) -> None:
     with sync_playwright() as p:
         b = p.chromium.launch(args=['--no-sandbox'])
         pg = b.new_page()

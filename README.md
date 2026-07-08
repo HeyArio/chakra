@@ -63,11 +63,6 @@ workflow JSON to import lives here.
 | `nazarban_service.py` | VPS | The engine: reads the xlsx, scores it, builds the HTML report, renders the PDF. Self-contained (scoring + template + renderer bundled). |
 | `fonts_b64.json` | VPS | Vazirmatn font weights (Farsi-Digits variant), base64-embedded so the PDF has zero external font deps. Must sit next to `nazarban_service.py`. |
 | `requirements.txt` | VPS | Python deps: openpyxl, flask, gunicorn, playwright. |
-| `chakra_bot_workflow.json` | n8n | Import this into n8n Cloud. 6 nodes, no Code nodes. |
-| `score_engine.py`, `build_report.py`, `render_pdf.py` | (reference) | The three parts of the engine, **un-bundled**. These are the same code as inside `nazarban_service.py`, kept separate for easier editing. **Not required at runtime** — the service imports only `nazarban_service.py`. |
-| `SETUP_GUIDE.md` | — | Step-by-step first-time deployment instructions. |
-| `sample-report.pdf` | — | Example output. |
-| `chakra-FILLED-sample.xlsx` | — | A survey with all 140 answers filled, for testing. |
 
 ---
 
@@ -186,8 +181,7 @@ Import `chakra_bot_workflow.json` into n8n Cloud. Six nodes:
 
 ## Customizing the report
 
-Edit the report-builder section of `nazarban_service.py` (or `build_report.py`, then
-re-bundle):
+Edit the report-builder section of `nazarban_service.py`:
 - **Colors** — `CHAKRA_COLOR` dict + the CSS palette at the top of the `<style>` block.
 - **Wordmark / tagline** — the `.brand` block in the HTML.
 - **Copy / interpretations** — `BAND_SUGGEST`, `ARCHE_DESC` (sourced from the workbook's
@@ -207,6 +201,9 @@ After editing, redeploy: upload the changed file to `/chakra`, `systemctl restar
 - Port 8099 is firewalled (iptables) to only the n8n server IP + localhost.
 - Shared-secret token (`NAZARBAN_TOKEN`) on every POST endpoint.
 - Chat ids and filenames are sanitized before touching the filesystem.
+- Upload validation: rejects non-.xlsx files and non-zip content (magic bytes).
+- Request size limit: 10 MB max.
+- Structured logging (INFO level) on uploads and errors.
 - Currently HTTP (not HTTPS). Fine for a private single-owner bot moving non-sensitive
   survey data. Upgrade path: put the service behind a reverse proxy with a TLS cert if it
   ever grows or handles sensitive data — no code changes needed.

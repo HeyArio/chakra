@@ -13,13 +13,18 @@ Endpoints:
 
 Pending uploads live in a temp dir, one slot per chat, auto-expire after TTL.
 """
-import os, tempfile, json, traceback, re, time
+import os, tempfile, json, re, time, logging
 from flask import Flask, request, send_file, jsonify
 
 import nazarban_service as svc
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10 MB
+
 TOKEN = os.environ.get('NAZARBAN_TOKEN', '')
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger('chakra')
 
 STORE_DIR = os.path.join(tempfile.gettempdir(), 'chakra_uploads')
 os.makedirs(STORE_DIR, exist_ok=True)
@@ -78,7 +83,8 @@ def report():
         try:
             return _render_response(in_path, name)
         except Exception as e:
-            return jsonify(ok=False, error=str(e), trace=traceback.format_exc()), 500
+            log.exception('report failed')
+            return jsonify(ok=False, error=str(e)), 500
 
 @app.route('/upload', methods=['POST'])
 def upload():
@@ -89,9 +95,18 @@ def upload():
     chat = _chat_key(request.form.get('chat', ''))
     if not chat:
         return jsonify(ok=False, error='no chat id'), 400
+    f = request.files['file']
+    if not f.filename or not f.filename.lower().endswith('.xlsx'):
+        return jsonify(ok=False, error='only .xlsx files accepted'), 400
+    # Reject files that aren't valid zip/xlsx (openpyxl reads zip internally)
+    head = f.stream.read(4)
+    f.stream.seek(0)
+    if head[:2] != b'PK':
+        return jsonify(ok=False, error='invalid xlsx file'), 400
     _sweep()
     path = os.path.join(STORE_DIR, 'chat_' + chat + '.xlsx')
-    request.files['file'].save(path)
+    f.save(path)
+    log.info('upload chat=%s file=%s size=%d', chat, f.filename, os.path.getsize(path))
     return jsonify(ok=True, chat=chat)
 
 @app.route('/render', methods=['POST'])
@@ -109,11 +124,13 @@ def render():
     try:
         resp = _render_response(path, name)
     except Exception as e:
-        return jsonify(ok=False, error=str(e), trace=traceback.format_exc()), 500
+        log.exception('render failed chat=%s', chat)
+        return jsonify(ok=False, error=str(e)), 500
     finally:
         try: os.remove(path)
         except OSError: pass
     return resp
 
 if __name__ == '__main__':
+    log.info('chakra starting on port %s', os.environ.get('PORT', '8099'))
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8099)))
