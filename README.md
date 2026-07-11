@@ -2,7 +2,8 @@
 
 A Telegram bot that turns a filled 140-question chakra/energy survey (`.xlsx`) into a
 branded **Nazarbanai** PDF report. The owner uploads the spreadsheet, the bot asks who
-it's for, and sends back a polished 2-page PDF named after that person.
+it's for, and sends back a polished 6-page PDF named after that person: 2 analysis pages
+plus a personalized **4-week energy growth & balance program** (one chakra per week).
 
 Built for **Nazarban Studio** / nazarbanai.com. Persian-first (RTL, Vazirmatn), dark
 editorial report design.
@@ -60,7 +61,8 @@ workflow JSON to import lives here.
 | File | Runs on | Purpose |
 |------|---------|---------|
 | `server.py` | VPS | Flask HTTP service. Endpoints: `/health`, `/upload`, `/render`, `/report`. |
-| `nazarban_service.py` | VPS | The engine: reads the xlsx, scores it, builds the HTML report, renders the PDF. Self-contained (scoring + template + renderer bundled). |
+| `nazarban_service.py` | VPS | The engine: reads the xlsx, scores it, builds the HTML report, renders the PDF. Scoring + template + renderer bundled; program copy lives in `program_content.py`. |
+| `program_content.py` | VPS | The 4-week program copy: 7 chakras × 3 score tiers × 6 sections (sleep, water affirmation, practice, frequency, incense, diet). Pure data — edit copy here, no logic. Must sit next to `nazarban_service.py`. |
 | `fonts_b64.json` | VPS | Vazirmatn font weights (Farsi-Digits variant), base64-embedded so the PDF has zero external font deps. Must sit next to `nazarban_service.py`. |
 | `requirements.txt` | VPS | Python deps: openpyxl, flask, gunicorn, playwright. |
 
@@ -97,6 +99,23 @@ i.e. a weighted 1–4 → 0–100 normalization that ignores blank answers. Plus
 - **level bands**: <35 نیازمند توجه جدی · 35–54 کم‌تعادل · 55–74 متعادل نسبی · 75–100 نقطه قوت
 
 If you touch scoring, keep it matching the workbook's `Calculations` sheet.
+
+### The 4-week program (pages 3–6)
+
+Client's rule, implemented in `build_week_plan()` (`nazarban_service.py`):
+
+- Walk the chakras **bottom-up**: root → sacral → solar → heart → throat → third-eye → crown.
+- Any chakra scoring **≤ 70** needs work and claims the next free week
+  (week 1 = the lowest such chakra on the spine).
+- If fewer than 4 chakras need work, remaining weeks are filled with the balanced
+  (> 70) chakras — still bottom-up — on their maintenance program.
+- Which of the 3 prescriptions a week uses depends only on that chakra's score:
+  **< 40** → پاکسازی و بازسازی پایه · **40–70** → تقویت و تثبیت · **> 70** → نگهداری و ارتقا.
+
+Each week page renders the fixed 6-part prescription from `program_content.py`:
+sleep, water + affirmation, mindful practice, music/frequency (396–963 Hz per chakra),
+incense, and diet (eat more / eat less). Framed as an energy growth & balance program,
+explicitly **not** medical treatment (disclaimer in the page footer).
 
 ---
 

@@ -7,6 +7,7 @@ from typing import Optional
 import openpyxl, warnings
 from openpyxl.utils import column_index_from_string
 from playwright.sync_api import sync_playwright
+from program_content import PROGRAM, TIER_LABEL, CHAKRA_THEME, CHAKRA_FREQ, water_note
 warnings.filterwarnings('ignore')
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -130,6 +131,31 @@ def score_workbook(path: str) -> dict:
     }
 
 
+# ===== 4-week growth program =====
+# Client's rule: walk the chakras bottom-up (root -> crown); any chakra
+# scoring 70 or below needs work and claims the next free week (week 1 =
+# lowest such chakra). If fewer than 4 need work, remaining weeks are
+# filled with the balanced (>70) chakras, still bottom-up, on their
+# maintenance program. Which of the 3 prescriptions a week uses depends
+# only on that chakra's score: <40 low, 40-70 mid, >70 high.
+
+BOTTOM_UP = ['root', 'sacral', 'solar', 'heart', 'throat', 'thirdeye', 'crown']
+PROGRAM_WEEKS = 4
+
+def tier_for(score: Optional[float]) -> str:
+    s = score if score is not None else 0
+    if s < 40: return 'low'
+    if s <= 70: return 'mid'
+    return 'high'
+
+def build_week_plan(chakras: dict) -> list:
+    needy  = [k for k in BOTTOM_UP if (chakras.get(k) or 0) <= 70]
+    steady = [k for k in BOTTOM_UP if k not in needy]
+    picked = (needy + steady)[:PROGRAM_WEEKS]
+    return [{'week': i, 'chakra': k, 'score': (chakras.get(k) or 0),
+             'tier': tier_for(chakras.get(k))}
+            for i, k in enumerate(picked, 1)]
+
 
 # ===== report builder =====
 
@@ -238,6 +264,119 @@ def _interp_rows(metrics: dict, labelmap: dict) -> str:
         )
     return ''.join(parts)
 
+_FA_DIGIT = {1: '۱', 2: '۲', 3: '۳', 4: '۴'}
+
+def _score_ring(score: float, color: str) -> str:
+    r = 34; circ = 2 * math.pi * r
+    filled = circ * max(0.0, min(100.0, score)) / 100
+    return f'''<svg width="96" height="96" viewBox="0 0 96 96">
+      <circle cx="48" cy="48" r="{r}" fill="none" stroke="#ffffff14" stroke-width="7"/>
+      <circle cx="48" cy="48" r="{r}" fill="none" stroke="{color}" stroke-width="7"
+        stroke-linecap="round" stroke-dasharray="{filled:.1f} {circ:.1f}"
+        transform="rotate(-90 48 48)"/>
+      <text x="48" y="55" text-anchor="middle" font-size="26" font-weight="900"
+        fill="#F4EEFA" font-family="Vazir">{score:.0f}</text>
+    </svg>'''
+
+def _week_map(plan: list, active: int) -> str:
+    items = ''
+    for j, wk in enumerate(plan):
+        k = wk['chakra']; c = CHAKRA_COLOR[k]
+        extra = f'border-color:{c}88;background:{c}14;' if j == active else ''
+        items += f'''<div class="wm-item" style="{extra}">
+          <span class="wm-dot" style="background:{c};box-shadow:0 0 7px {c}"></span>
+          <span class="wm-w">هفته {_FA_DIGIT[wk['week']]}</span>
+          <span class="wm-c">{CHAKRA_LABEL[k]}</span>
+          <span class="wm-s">{wk['score']:.0f}</span>
+        </div>'''
+    return f'<div class="week-map">{items}</div>'
+
+def _pcard(num: str, title: str, body: str, color: str, extra_cls: str = '') -> str:
+    return f'''<div class="pcard {extra_cls}">
+      <div class="pcard-h">
+        <span class="pcard-n" style="color:{color};background:{color}1c;border:1px solid {color}55">{num}</span>
+        <span class="pcard-t">{title}</span>
+      </div>{body}</div>'''
+
+def _chips(items: list, color: str) -> str:
+    return '<div class="pchips">' + ''.join(
+        f'<span class="pchip" style="border-color:{color}44">{x}</span>' for x in items) + '</div>'
+
+def _week_page(plan: list, idx: int, person_block: str, date_str: str) -> str:
+    wk = plan[idx]
+    k = wk['chakra']; c = CHAKRA_COLOR[k]; score = wk['score']
+    t = PROGRAM[k][wk['tier']]
+    band_range, band_name = TIER_LABEL[wk['tier']]
+
+    # 1. sleep
+    sleep = f'<div class="ln em">{t["sleep"][0]}</div>' + \
+            ''.join(f'<div class="ln">{x}</div>' for x in t['sleep'][1:])
+    if t.get('sleep_note'):
+        sleep += f'<div class="pnote">{t["sleep_note"]}</div>'
+    # 2. water + affirmations
+    water = f'<div class="ln">{water_note(t)}</div>' + \
+            f'<div class="affirm" style="border-color:{c}66">' + \
+            ''.join(f'<div class="af-ln">{x}</div>' for x in t['water']) + '</div>'
+    # 3. practice
+    practice = ''.join(f'<div class="ln{" em" if i == 0 else ""}">{x}</div>'
+                       for i, x in enumerate(t['practice']))
+    # 4. music
+    m0 = t['music'][0].replace(f'فرکانس {CHAKRA_FREQ[k]}', '').strip().lstrip('+ ').strip()
+    music_lines = ([m0] if m0 else []) + t['music'][1:]
+    music = f'<div class="freq" style="color:{c};border-color:{c}55;background:{c}12">{CHAKRA_FREQ[k]}</div>' + \
+            ''.join(f'<div class="ln">{x}</div>' for x in music_lines)
+    # 5. scent
+    scent = _chips(t['scent'], c)
+    if t.get('scent_note'):
+        scent += f'<div class="pnote">{t["scent_note"]}</div>'
+    # 6. food
+    food = f'''<div class="food-cols">
+      <div class="food-col">
+        <div class="food-h do">بیشتر مصرف شود</div>{_chips(t['food_do'], '#4FB477')}
+      </div>
+      <div class="food-col">
+        <div class="food-h avoid">کمتر مصرف شود</div>{_chips(t['food_avoid'], '#E5484D')}
+      </div>
+    </div>'''
+
+    return f'''<div class="page">
+  <div class="head">
+    <div class="brand"><div class="wordmark">نظربان</div><div class="latin">Nazarbanai</div></div>
+    <div class="head-meta">
+      {person_block}
+      <span>برنامه رشد و تعادل انرژی · هفته {_FA_DIGIT[wk['week']]} از ۴</span><br>
+      <span>{html.escape(date_str)}</span>
+    </div>
+  </div>
+
+  {_week_map(plan, idx)}
+
+  <div class="wk-hero" style="border-color:{c}33">
+    <div class="wk-glow" style="background:radial-gradient(60% 90% at 85% 10%, {c}2e 0%, transparent 70%)"></div>
+    <div class="wk-body">
+      <div class="wk-kicker" style="color:{c}">هفته {_FA_DIGIT[wk['week']]} · چاکرای {CHAKRA_LABEL[k]}</div>
+      <div class="wk-title">{CHAKRA_THEME[k]}</div>
+      <div class="wk-status">{t['status']}</div>
+      <div class="wk-band" style="color:{c};border-color:{c}55;background:{c}14">امتیاز {band_range} · {band_name}</div>
+    </div>
+    <div class="wk-ring">{_score_ring(score, c)}</div>
+  </div>
+
+  <div class="pgrid">
+    {_pcard('۱', 'خواب', sleep, c)}
+    {_pcard('۲', 'آب و بارورسازی آب', water, c)}
+    {_pcard('۳', 'تمرین آگاهانه', practice, c)}
+    {_pcard('۴', 'موسیقی و فرکانس', music, c)}
+    {_pcard('۵', 'رایحه و عود', scent, c, 'span2')}
+    {_pcard('۶', 'الگوی غذایی', food, c, 'span2')}
+  </div>
+
+  <div class="foot">
+    <div class="disc">این برنامه، یک برنامه رشد و تعادل انرژی است و جایگزین درمان پزشکی، روان‌درمانی یا رژیم‌درمانی نیست. در صورت وجود بیماری یا رژیم خاص، با پزشک خود هماهنگ کنید.</div>
+    <div class="foot-brand">نظربان · Nazarbanai</div>
+  </div>
+</div>'''
+
 def build_html(data: dict, fonts_b64: dict, person_name: str = '', date_str: str = '') -> str:
     m=data['metrics']
     chak=data['chakras']
@@ -256,6 +395,9 @@ def build_html(data: dict, fonts_b64: dict, person_name: str = '', date_str: str
     fontface=ff('vazir-regular',400)+ff('vazir-medium',500)+ff('vazir-bold',700)+ff('vazir-black',900)
 
     person_block=f'<span class="meta-name">{html.escape(person_name)}</span>' if person_name else ''
+
+    plan = build_week_plan(chak)
+    program_pages = ''.join(_week_page(plan, i, person_block, date_str) for i in range(len(plan)))
 
     return f'''<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <style>
@@ -346,6 +488,49 @@ html,body{{font-family:'Vazir',sans-serif;color:#F4EEFA;background:#0f0b18;-webk
 .interp-row{{border-inline-start:2px solid;padding:8px 12px;margin-bottom:9px;background:#ffffff06;border-radius:0 10px 10px 0}}
 .interp-row .t{{font-size:12.5px;color:#e6dcf7;font-weight:700;display:flex;justify-content:space-between}}
 .interp-row .s{{font-size:11.5px;color:#a99dc4;margin-top:3px;line-height:1.7}}
+
+/* ===== 4-week program pages ===== */
+.week-map{{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin-top:14px}}
+.wm-item{{display:flex;align-items:center;gap:7px;padding:8px 11px;border-radius:12px;
+   background:#ffffff07;border:1px solid #ffffff14;font-size:11px;color:#a99dc4}}
+.wm-dot{{width:8px;height:8px;border-radius:50%;flex-shrink:0}}
+.wm-w{{font-weight:700;color:#e6dcf7;white-space:nowrap}}
+.wm-c{{white-space:nowrap}}
+.wm-s{{margin-inline-start:auto;font-weight:700;color:#cabfe0}}
+
+.wk-hero{{position:relative;overflow:hidden;display:grid;grid-template-columns:1fr auto;gap:18px;align-items:center;
+   background:linear-gradient(100deg,#241b3e 0%,#181128 100%);border:1px solid #ffffff14;border-radius:18px;
+   padding:18px 22px;margin-top:14px}}
+.wk-glow{{position:absolute;inset:0;pointer-events:none}}
+.wk-body{{position:relative}}
+.wk-kicker{{font-size:12px;font-weight:700;letter-spacing:.3px}}
+.wk-title{{font-size:21px;font-weight:900;color:#efe8fb;margin:5px 0 7px}}
+.wk-status{{font-size:11.5px;color:#b7abd0;line-height:1.85;max-width:56ch}}
+.wk-band{{display:inline-block;font-size:11px;font-weight:700;padding:5px 12px;border-radius:20px;
+   border:1px solid;margin-top:10px}}
+.wk-ring{{position:relative;display:flex;align-items:center;justify-content:center}}
+
+.pgrid{{display:grid;grid-template-columns:1fr 1fr;gap:11px;margin-top:14px;flex:1;align-content:stretch}}
+.pcard{{background:#ffffff07;border:1px solid #ffffff12;border-radius:14px;padding:13px 15px}}
+.pcard.span2{{grid-column:1 / -1}}
+.pcard-h{{display:flex;align-items:center;gap:9px;margin-bottom:9px}}
+.pcard-n{{width:22px;height:22px;border-radius:7px;display:flex;align-items:center;justify-content:center;
+   font-size:11.5px;font-weight:900;flex-shrink:0}}
+.pcard-t{{font-size:13px;font-weight:700;color:#efe8fb}}
+.ln{{font-size:11px;color:#b7abd0;line-height:1.85}}
+.ln.em{{color:#e6dcf7;font-weight:700}}
+.pnote{{font-size:10px;color:#8f83aa;line-height:1.75;margin-top:7px;padding-top:7px;border-top:1px dashed #ffffff14}}
+.affirm{{border-inline-start:2px solid;padding:7px 11px;margin-top:8px;background:#ffffff05;border-radius:0 10px 10px 0}}
+.af-ln{{font-size:11px;color:#d9cdf0;line-height:1.95;font-weight:500}}
+.freq{{display:inline-block;font-size:15px;font-weight:900;letter-spacing:.5px;padding:4px 14px;
+   border-radius:10px;border:1px solid;margin-bottom:8px;direction:ltr}}
+.pchips{{display:flex;flex-wrap:wrap;gap:6px}}
+.pchip{{font-size:10.5px;padding:4px 10px;border-radius:14px;background:#ffffff0a;
+   border:1px solid;color:#cabfe0;white-space:nowrap}}
+.food-cols{{display:grid;grid-template-columns:1.4fr 1fr;gap:14px}}
+.food-h{{font-size:11px;font-weight:700;margin-bottom:7px}}
+.food-h.do{{color:#7fe0a6}}
+.food-h.avoid{{color:#f09a9d}}
 
 /* footer / disclaimer */
 .foot{{margin-top:auto;border-top:1px solid #ffffff14;padding-top:11px;display:flex;justify-content:space-between;align-items:center}}
@@ -446,6 +631,9 @@ html,body{{font-family:'Vazir',sans-serif;color:#F4EEFA;background:#0f0b18;-webk
     <div class="foot-brand">نظربان · Nazarbanai</div>
   </div>
 </div>
+
+<!-- ============== 4-WEEK PROGRAM PAGES ============== -->
+{program_pages}
 </body></html>'''
 
 
@@ -474,4 +662,5 @@ if __name__ == '__main__':
                       'overall': data['overall_score'],
                       'dominant': data['dominant_fa'],
                       'archetype': data['archetype'],
-                      'confidence': data['confidence']}, ensure_ascii=False))
+                      'confidence': data['confidence'],
+                      'weeks': build_week_plan(data['chakras'])}, ensure_ascii=False))
