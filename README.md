@@ -2,8 +2,10 @@
 
 A Telegram bot that turns a filled 140-question chakra/energy survey (`.xlsx`) into a
 branded PDF report (wordmark: «شاهراه ثروت»). The owner uploads the spreadsheet, the bot asks who
-it's for, and sends back a polished 6-page PDF named after that person: 2 analysis pages
-plus a personalized **4-week energy growth & balance program** (one chakra per week).
+it's for, and sends back a polished 7-page PDF named after that person: 2 analysis pages,
+a personalized **4-week energy growth & balance program** (one chakra per week), and a
+closing summary page with a personalized note, a printable **28-day habit tracker** and a
+"re-test after 28 days" invitation.
 
 Built for **Nazarban Studio** / nazarbanai.com. Persian-first (RTL, Vazirmatn), dark
 editorial report design.
@@ -65,6 +67,7 @@ workflow JSON to import lives here.
 | `program_content.py` | VPS | The 4-week program copy: 7 chakras × 3 score tiers × 6 sections (sleep, water affirmation, practice, frequency, incense, diet). Pure data — edit copy here, no logic. Must sit next to `nazarban_service.py`. |
 | `fonts_b64.json` | VPS | Vazirmatn font weights (Farsi-Digits variant), base64-embedded so the PDF has zero external font deps. Must sit next to `nazarban_service.py`. |
 | `requirements.txt` | VPS | Python deps: openpyxl, flask, gunicorn, playwright. |
+| `tests/test_engine.py` | dev | Self-check for scoring, week-plan rules and report structure. Run `python3 tests/test_engine.py` after touching the engine — 35 checks, no test framework needed. |
 
 ---
 
@@ -117,6 +120,19 @@ sleep, water + affirmation, mindful practice, music/frequency (396–963 Hz per 
 incense, and diet (eat more / eat less). Framed as an energy growth & balance program,
 explicitly **not** medical treatment (disclaimer in the page footer).
 
+### The closing page (page 7)
+
+Rendered by `_closing_page()` (`nazarban_service.py`), it turns the report from something
+you read into something you use for a month:
+
+- **Personalized closing note** — greets the person by name («… عزیز،»), falls back to
+  «همراه عزیز،» when no name was given.
+- **4-week recap cards** — week, chakra, score, theme and prescription tier at a glance.
+- **28-day habit tracker** — 6 daily practices × 28 day-circles, column groups tinted
+  with each week's chakra color. Print it or tick it in a PDF app; "don't break the chain."
+- **Re-test invitation** — suggests filling the survey again after the 28 days to see
+  growth per center in numbers (and naturally brings the customer back).
+
 ---
 
 ## HTTP API (VPS)
@@ -128,7 +144,7 @@ the systemd env). Returns 401 if it doesn't match.
 |--------|------|------|---------|
 | GET | `/health` | — | `{"ok":true,"service":"chakra-report"}` |
 | POST | `/upload` | multipart: `file` (xlsx), `chat` (chat id) | `{"ok":true,"chat":"..."}` — stashes the file keyed by chat |
-| POST | `/render` | form or JSON: `chat` (chat id), `name` | the PDF (`application/pdf`), one-time use — deletes the stash |
+| POST | `/render` | form or JSON: `chat` (chat id), `name` | the PDF (`application/pdf`) — deletes the stash on success; on failure the stash is kept (until TTL) so the owner can retry by re-sending just the name |
 | POST | `/report` | multipart: `file`, `name` | the PDF in one shot (no chat needed; kept for convenience) |
 
 Pending uploads live in `$TMPDIR/chakra_uploads/`, one slot per chat, auto-expire after
@@ -164,8 +180,14 @@ The unit sets `NAZARBAN_TOKEN` and runs:
 
 ### Editing → deploying loop
 1. Edit a file in `/chakra`
-2. `systemctl restart chakra`
-3. `curl -s http://localhost:8099/health` to confirm it came back
+2. `python3 tests/test_engine.py` — 35 fast checks on scoring, plan rules and report structure
+3. `systemctl restart chakra`
+4. `curl -s http://localhost:8099/health` to confirm it came back
+
+### Rendering on a dev machine
+If playwright's own chromium download isn't installed locally, point the renderer at any
+chromium binary instead: `CHAKRA_CHROMIUM=/path/to/chrome python3 nazarban_service.py in.xlsx out.pdf "نام"`.
+Leave it unset on the VPS (default playwright browser resolution).
 
 ---
 
@@ -205,6 +227,8 @@ Edit the report-builder section of `nazarban_service.py`:
 - **Wordmark / tagline** — the `.brand` block in the HTML.
 - **Copy / interpretations** — `BAND_SUGGEST`, `ARCHE_DESC` (sourced from the workbook's
   Interpretation and Archetypes sheets).
+- **Closing page** — greeting + note copy in `_closing_page()`, tracker practice labels in
+  `_TRACK_ROWS`, recap cards in `_recap_cards()`.
 - **Layout** — two `.page` divs (A4, fixed height). Signature element is the "energy spine"
   (vertical stack of 7 chakra bars). Restyled radar chart, per-chakra interpretation rows.
 

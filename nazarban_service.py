@@ -126,6 +126,11 @@ def score_workbook(path: str) -> dict:
 
     # completion / confidence
     answered = sum(1 for a in answers if a is not None)
+    if answered == 0:
+        # fail with a message the bot owner can act on, instead of a
+        # cryptic KeyError later in the report builder
+        raise ValueError('پرسشنامه خالی است — ستون B شیت Responses پاسخی ندارد '
+                         '(no answers found in Responses column B)')
     confidence = round(answered / TOTAL_QUESTIONS * 100, 1)
 
     # overall balance = 100 - population stdev of 7 chakra scores
@@ -439,6 +444,83 @@ def _week_page(plan: list, idx: int, person_block: str, date_str: str) -> str:
   </div>
 </div>'''
 
+# ===== closing summary page (page 7) =====
+# The six daily practice rows shown in the 28-day tracker (icon key, label).
+_TRACK_ROWS = [
+    ('sleep', 'خواب'), ('water', 'آب و بارورسازی'), ('practice', 'تمرین آگاهانه'),
+    ('music', 'موسیقی و فرکانس'), ('scent', 'رایحه و عود'), ('food', 'الگوی غذایی'),
+]
+
+def _recap_cards(plan: list) -> str:
+    cards = ''
+    for wk in plan:
+        k = wk['chakra']; c = CHAKRA_COLOR[k]
+        _, band_name = TIER_LABEL[wk['tier']]
+        score_fa = f"{wk['score']:.0f}".translate(_FA_DIGITS)
+        cards += f'''<div class="rc" style="border-color:{c}40">
+          <div class="rc-w" style="color:{c}"><span>هفته {_FA_DIGIT[wk['week']]}</span><span class="rc-sc">امتیاز {score_fa}</span></div>
+          <div class="rc-c"><span class="rc-dot" style="background:{c};box-shadow:0 0 7px {c}"></span>چاکرای {CHAKRA_LABEL[k]}</div>
+          <div class="rc-theme">{CHAKRA_THEME[k]}</div>
+          <div class="rc-tier" style="color:{c};border-color:{c}44">{band_name}</div>
+        </div>'''
+    return f'<div class="recap">{cards}</div>'
+
+def _tracker(plan: list) -> str:
+    """6 practices x 28 days; each week column group tinted with its chakra."""
+    cells = '<div></div>'
+    for wk in plan:
+        k = wk['chakra']; c = CHAKRA_COLOR[k]
+        # no '·' between digit and name: at this size the middot reads like a
+        # Persian zero («هفته ۲ · خاجی» -> «هفته ۲۰ خاجی»)
+        cells += (f'<div class="trk-wk"><span class="wm-dot" style="background:{c};box-shadow:0 0 6px {c}"></span>'
+                  f'هفته {_FA_DIGIT[wk["week"]]}<span class="trk-wk-c">{CHAKRA_LABEL[k]}</span></div>')
+    for icon, label in _TRACK_ROWS:
+        cells += f'<div class="trk-label">{_icon_svg(icon, "#a99dc4", 12)}<span>{label}</span></div>'
+        for wk in plan:
+            c = CHAKRA_COLOR[wk['chakra']]
+            dots = ''.join(f'<span class="trk-day" style="border-color:{c}77"></span>' for _ in range(7))
+            cells += f'<div class="trk-days" style="background:{c}0d">{dots}</div>'
+    return f'<div class="trk">{cells}</div>'
+
+def _closing_page(plan: list, person_block: str, person_name: str, date_str: str) -> str:
+    greeting = f'{html.escape(person_name)} عزیز،' if person_name else 'همراه عزیز،'
+    return f'''<div class="page close-page">
+  <div class="head">
+    <div class="brand"><div class="wordmark">شاهراه ثروت</div></div>
+    <div class="head-meta">
+      {person_block}
+      <span>خلاصه برنامه · پیگیری ۲۸ روزه</span><br>
+      <span>{html.escape(date_str)}</span>
+    </div>
+  </div>
+
+  <div class="close-note">
+    <div class="close-hi">{greeting}</div>
+    <div class="close-txt">این گزارش پایان مسیر نیست؛ نقطه شروع آن است. انرژی با حرکت‌های کوچکِ هرروزه رشد می‌کند، نه با تلاش‌های بزرگِ گاه‌به‌گاه. اگر ۲۸ روز با برنامه‌ات همراه بمانی، تفاوت را در آرامش، تمرکز و کیفیت تصمیم‌هایت حس خواهی کرد.</div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-h"><span class="sec-n">۰۶</span><span class="sec-t">مسیر چهار هفته در یک نگاه</span><span class="sec-line"></span></div>
+    {_recap_cards(plan)}
+  </div>
+
+  <div class="sec">
+    <div class="sec-h"><span class="sec-n">۰۷</span><span class="sec-t">جدول پیگیری ۲۸ روز</span><span class="sec-line"></span></div>
+    <div class="trk-hint">هر شب، دایره تمرین‌هایی که انجام داده‌ای را پر کن — می‌توانی این صفحه را چاپ کنی یا روی موبایل علامت بزنی. زنجیره را نشکن.</div>
+    {_tracker(plan)}
+  </div>
+
+  <div class="retest">
+    <div class="rt-t">بعد از ۲۸ روز چه کنیم؟</div>
+    <div class="rt-d">پرسشنامه را یک‌بار دیگر کامل کن و گزارش تازه‌ات را کنار همین گزارش بگذار؛ رشد هر مرکز انرژی را با عدد می‌بینی و برنامه چهار هفته بعدی، بر اساس وضعیت جدیدت ساخته می‌شود.</div>
+  </div>
+
+  <div class="foot">
+    <div class="disc">این برنامه، یک برنامه رشد و تعادل انرژی است و جایگزین درمان پزشکی، روان‌درمانی یا رژیم‌درمانی نیست. در صورت وجود بیماری یا رژیم خاص، با پزشک خود هماهنگ کنید.</div>
+    <div class="foot-brand">شاهراه ثروت</div>
+  </div>
+</div>'''
+
 def build_html(data: dict, fonts_b64: dict, person_name: str = '', date_str: str = '') -> str:
     date_str = date_str or today_jalali()  # auto-stamp the render date (Jalali, Iran time)
     m=data['metrics']
@@ -461,6 +543,7 @@ def build_html(data: dict, fonts_b64: dict, person_name: str = '', date_str: str
 
     plan = build_week_plan(chak)
     program_pages = ''.join(_week_page(plan, i, person_block, date_str) for i in range(len(plan)))
+    closing_page = _closing_page(plan, person_block, person_name, date_str)
 
     return f'''<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <style>
@@ -595,6 +678,31 @@ html,body{{font-family:'Vazir',sans-serif;color:#F4EEFA;background:#0f0b18;-webk
 .food-h.do{{color:#7fe0a6}}
 .food-h.avoid{{color:#f09a9d}}
 
+/* ===== closing summary page ===== */
+.close-page .sec{{margin-top:26px}}
+.close-note{{background:linear-gradient(100deg,#2a1f45 0%,#1b1430 100%);border:1px solid #ffffff14;border-radius:18px;padding:22px 24px;margin-top:18px}}
+.close-hi{{font-size:16px;font-weight:900;color:#efe8fb;margin-bottom:8px}}
+.close-txt{{font-size:12px;color:#b7abd0;line-height:2.05;max-width:88ch}}
+.recap{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}}
+.rc{{background:#ffffff07;border:1px solid;border-radius:14px;padding:14px 15px}}
+.rc-w{{display:flex;justify-content:space-between;align-items:baseline;font-size:11px;font-weight:700;letter-spacing:.3px}}
+.rc-sc{{font-size:10px;color:#a99dc4;font-weight:500}}
+.rc-c{{display:flex;align-items:center;gap:7px;font-size:13.5px;font-weight:700;color:#efe8fb;margin:7px 0 4px}}
+.rc-dot{{width:8px;height:8px;border-radius:50%;flex-shrink:0}}
+.rc-theme{{font-size:10.5px;color:#a99dc4;line-height:1.7}}
+.rc-tier{{display:inline-block;font-size:10px;font-weight:700;border:1px solid;border-radius:12px;padding:3px 9px;margin-top:9px}}
+.trk-hint{{font-size:11px;color:#a99dc4;line-height:1.8;margin:-3px 0 13px}}
+.trk{{display:grid;grid-template-columns:120px repeat(4,1fr);gap:10px;align-items:center}}
+.trk-wk{{display:flex;align-items:center;justify-content:center;gap:6px;font-size:11px;color:#cabfe0;font-weight:700;white-space:nowrap}}
+.trk-wk-c{{color:#8f83aa;font-weight:500}}
+.trk-label{{display:flex;align-items:center;gap:7px;font-size:11.5px;color:#cabfe0}}
+.trk-label svg{{flex-shrink:0}}
+.trk-days{{display:flex;justify-content:space-evenly;align-items:center;border-radius:10px;padding:9px 5px;border:1px solid #ffffff0a}}
+.trk-day{{width:13px;height:13px;border-radius:50%;border:1.5px solid;box-sizing:border-box}}
+.retest{{display:grid;grid-template-columns:auto 1fr;gap:16px;align-items:center;background:#ffffff08;border:1px dashed #8a6bff55;border-radius:14px;padding:17px 20px;margin-top:26px}}
+.rt-t{{font-size:13px;font-weight:900;color:#d9c8ff;white-space:nowrap}}
+.rt-d{{font-size:11.5px;color:#b0a4c9;line-height:1.85}}
+
 /* footer / disclaimer */
 .foot{{margin-top:auto;border-top:1px solid #ffffff14;padding-top:11px;display:flex;justify-content:space-between;align-items:center}}
 .disc{{font-size:10px;color:#7c7196;line-height:1.7;max-width:70%}}
@@ -696,14 +804,21 @@ html,body{{font-family:'Vazir',sans-serif;color:#F4EEFA;background:#0f0b18;-webk
 
 <!-- ============== 4-WEEK PROGRAM PAGES ============== -->
 {program_pages}
+
+<!-- ============== CLOSING SUMMARY PAGE ============== -->
+{closing_page}
 </body></html>'''
 
 
 
 # ===== renderer =====
 def render_html_to_pdf(html_str: str, pdf_path: str) -> None:
+    # CHAKRA_CHROMIUM: optional path to a chromium binary, for dev machines
+    # where playwright's own browser download isn't installed. Unset (the
+    # VPS case) keeps playwright's default browser resolution.
+    exe = os.environ.get('CHAKRA_CHROMIUM') or None
     with sync_playwright() as p:
-        b = p.chromium.launch(args=['--no-sandbox'])
+        b = p.chromium.launch(args=['--no-sandbox'], executable_path=exe)
         pg = b.new_page()
         pg.set_content(html_str, wait_until='networkidle')
         pg.pdf(path=pdf_path, format='A4', print_background=True,
