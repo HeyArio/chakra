@@ -13,7 +13,7 @@ Endpoints:
 
 Pending uploads live in a temp dir, one slot per chat, auto-expire after TTL.
 """
-import os, tempfile, json, re, time, logging
+import io, os, tempfile, json, re, time, logging
 from flask import Flask, request, send_file, jsonify
 
 import nazarban_service as svc
@@ -43,13 +43,17 @@ def _chat_key(chat):
     return re.sub(r'[^0-9\-]', '', str(chat))
 
 def _render_response(in_path, name, date=''):
-    td = tempfile.mkdtemp()
-    out_path = os.path.join(td, 'out.pdf')
     data = svc.score_workbook(in_path)
     fonts = svc._load_fonts()
     html_str = svc.build_html(data, fonts, person_name=name, date_str=date)
-    svc.render_html_to_pdf(html_str, out_path)
-    resp = send_file(out_path, mimetype='application/pdf',
+    # render into a self-cleaning temp dir and serve from memory,
+    # so nothing is left behind on disk after the response
+    with tempfile.TemporaryDirectory() as td:
+        out_path = os.path.join(td, 'out.pdf')
+        svc.render_html_to_pdf(html_str, out_path)
+        with open(out_path, 'rb') as fh:
+            pdf_bytes = fh.read()
+    resp = send_file(io.BytesIO(pdf_bytes), mimetype='application/pdf',
                      as_attachment=True, download_name=_safe_name(name))
     resp.headers['X-Overall'] = str(data['overall_score'])
     resp.headers['X-Dominant'] = data['dominant']
@@ -124,11 +128,14 @@ def render():
     try:
         resp = _render_response(path, name)
     except Exception as e:
-        log.exception('render failed chat=%s', chat)
+        # keep the stashed upload so the owner can retry by re-sending
+        # just the name (it still expires after UPLOAD_TTL)
+        log.exception('render failed chat=%s (upload kept for retry)', chat)
         return jsonify(ok=False, error=str(e)), 500
-    finally:
-        try: os.remove(path)
-        except OSError: pass
+    try: os.remove(path)
+    except OSError: pass
+    log.info('render ok chat=%s name=%s overall=%s', chat, name,
+             resp.headers.get('X-Overall'))
     return resp
 
 if __name__ == '__main__':
