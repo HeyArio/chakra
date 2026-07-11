@@ -1,7 +1,7 @@
 # Chakra — Telegram Energy/Chakra Report Bot
 
 A Telegram bot that turns a filled 140-question chakra/energy survey (`.xlsx`) into a
-branded **Nazarbanai** PDF report. The owner uploads the spreadsheet, the bot asks who
+branded PDF report (wordmark: «شاهراه ثروت»). The owner uploads the spreadsheet, the bot asks who
 it's for, and sends back a polished 6-page PDF named after that person: 2 analysis pages
 plus a personalized **4-week energy growth & balance program** (one chakra per week).
 
@@ -209,7 +209,7 @@ Edit the report-builder section of `nazarban_service.py`:
   (vertical stack of 7 chakra bars). Restyled radar chart, per-chakra interpretation rows.
 
 The report is deliberately distinct from the client's original "AURA" dashboard mockup:
-editorial single-column with numbered sections, not an app UI. Branding is Nazarbanai.
+editorial single-column with numbered sections, not an app UI. Branding: the report wordmark is «شاهراه ثروت» (Farsi only).
 
 After editing, redeploy: upload the changed file to `/chakra`, `systemctl restart chakra`.
 

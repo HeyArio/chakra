@@ -403,7 +403,7 @@ def _week_page(plan: list, idx: int, person_block: str, date_str: str) -> str:
 
     return f'''<div class="page">
   <div class="head">
-    <div class="brand"><div class="wordmark">نظربان</div><div class="latin">Nazarbanai</div></div>
+    <div class="brand"><div class="wordmark">شاهراه ثروت</div></div>
     <div class="head-meta">
       {person_block}
       <span>برنامه رشد و تعادل انرژی · هفته {_FA_DIGIT[wk['week']]} از ۴</span><br>
@@ -435,7 +435,7 @@ def _week_page(plan: list, idx: int, person_block: str, date_str: str) -> str:
 
   <div class="foot">
     <div class="disc">این برنامه، یک برنامه رشد و تعادل انرژی است و جایگزین درمان پزشکی، روان‌درمانی یا رژیم‌درمانی نیست. در صورت وجود بیماری یا رژیم خاص، با پزشک خود هماهنگ کنید.</div>
-    <div class="foot-brand">نظربان · Nazarbanai</div>
+    <div class="foot-brand">شاهراه ثروت</div>
   </div>
 </div>'''
 
@@ -605,8 +605,7 @@ html,body{{font-family:'Vazir',sans-serif;color:#F4EEFA;background:#0f0b18;-webk
 <div class="page">
   <div class="head">
     <div class="brand">
-      <div class="wordmark">نظربان</div>
-      <div class="latin">Nazarbanai</div>
+      <div class="wordmark">شاهراه ثروت</div>
       <div class="tagline">تحلیل انرژی و تعادل درونی</div>
     </div>
     <div class="head-meta">
@@ -652,14 +651,14 @@ html,body{{font-family:'Vazir',sans-serif;color:#F4EEFA;background:#0f0b18;-webk
 
   <div class="foot">
     <div class="disc">این گزارش ابزار خودشناسی و توسعه فردی است و جایگزین تشخیص پزشکی، روان‌پزشکی یا مشاوره مالی نیست. وزن‌ها و امتیازها بر پایه نسخه اولیه محصول محاسبه شده‌اند.</div>
-    <div class="foot-brand">nazarbanai.com</div>
+    <div class="foot-brand">شاهراه ثروت</div>
   </div>
 </div>
 
 <!-- ===================== PAGE 2 ===================== -->
 <div class="page">
   <div class="head">
-    <div class="brand"><div class="wordmark">نظربان</div><div class="latin">Nazarbanai</div></div>
+    <div class="brand"><div class="wordmark">شاهراه ثروت</div></div>
     <div class="head-meta"><span>ادامه گزارش · ابعاد و مسیر رشد</span></div>
   </div>
 
@@ -691,7 +690,7 @@ html,body{{font-family:'Vazir',sans-serif;color:#F4EEFA;background:#0f0b18;-webk
 
   <div class="foot">
     <div class="disc">نتایج بر اساس پاسخ‌های ثبت‌شده در پرسشنامه ۱۴۰ سؤالی تولید شده‌اند. برای اعتبار بیشتر، پاسخ‌ها را کامل و صادقانه تکمیل کنید.</div>
-    <div class="foot-brand">نظربان · Nazarbanai</div>
+    <div class="foot-brand">شاهراه ثروت</div>
   </div>
 </div>
 
