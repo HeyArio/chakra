@@ -266,15 +266,46 @@ def _interp_rows(metrics: dict, labelmap: dict) -> str:
 
 _FA_DIGIT = {1: '۱', 2: '۲', 3: '۳', 4: '۴'}
 
-def _score_ring(score: float, color: str) -> str:
-    r = 34; circ = 2 * math.pi * r
+# 24x24 stroke line icons for the six prescription sections
+_ICON = {
+    'sleep':    '<path d="M20.2 14.8A8.5 8.5 0 1 1 9.2 3.8a7.2 7.2 0 0 0 11 11z"/>',
+    'water':    '<path d="M12 3.6s6 6.3 6 10.3a6 6 0 0 1-12 0c0-4 6-10.3 6-10.3z"/>',
+    'practice': '<ellipse cx="12" cy="9.8" rx="2.5" ry="5.3"/>'
+                '<ellipse cx="12" cy="9.8" rx="2.5" ry="5.3" transform="rotate(42 12 15)"/>'
+                '<ellipse cx="12" cy="9.8" rx="2.5" ry="5.3" transform="rotate(-42 12 15)"/>'
+                '<path d="M4.2 15.2c1.3 3.5 4.4 5.2 7.8 5.2s6.5-1.7 7.8-5.2"/>',
+    'music':    '<path d="M4.5 10.5v3M8.25 7.5v9M12 9.5v5M15.75 5.5v13M19.5 10v4"/>',
+    'scent':    '<path d="M12 3.2c-1.5 1.7-1.5 3.2 0 4.7s1.5 3 0 4.7"/>'
+                '<path d="M7.8 16h8.4M9.6 19.5h4.8"/>',
+    'food':     '<path d="M4 13h16a8 8 0 0 1-16 0z"/>'
+                '<path d="M9.3 9.2c0-1.1 1-1.6 1-2.9M13.7 9.2c0-1.1 1-1.6 1-2.9"/>',
+}
+
+def _icon_svg(name: str, color: str, size: int = 14) -> str:
+    return (f'<svg viewBox="0 0 24 24" width="{size}" height="{size}" fill="none" '
+            f'stroke="{color}" stroke-width="1.7" stroke-linecap="round" '
+            f'stroke-linejoin="round">{_ICON[name]}</svg>')
+
+# traditional petal counts per chakra, drawn as line art around the score ring
+CHAKRA_PETALS = {'root': 4, 'sacral': 6, 'solar': 10, 'heart': 12,
+                 'throat': 16, 'thirdeye': 2, 'crown': 20}
+
+def _score_ring(score: float, color: str, petals: int) -> str:
+    C = 55; r = 31; circ = 2 * math.pi * r
     filled = circ * max(0.0, min(100.0, score)) / 100
-    return f'''<svg width="96" height="96" viewBox="0 0 96 96">
-      <circle cx="48" cy="48" r="{r}" fill="none" stroke="#ffffff14" stroke-width="7"/>
-      <circle cx="48" cy="48" r="{r}" fill="none" stroke="{color}" stroke-width="7"
+    offset = 90 if petals == 2 else 0  # third eye: two side petals
+    pet = ''.join(
+        f'<ellipse cx="{C}" cy="12.5" rx="4.2" ry="7.5" fill="none" stroke="{color}" '
+        f'stroke-opacity="0.38" stroke-width="1.3" '
+        f'transform="rotate({offset + i * 360 / petals:.1f} {C} {C})"/>'
+        for i in range(petals))
+    return f'''<svg width="110" height="110" viewBox="0 0 110 110">
+      {pet}
+      <circle cx="{C}" cy="{C}" r="{r}" fill="none" stroke="#ffffff14" stroke-width="7"/>
+      <circle cx="{C}" cy="{C}" r="{r}" fill="none" stroke="{color}" stroke-width="7"
         stroke-linecap="round" stroke-dasharray="{filled:.1f} {circ:.1f}"
-        transform="rotate(-90 48 48)"/>
-      <text x="48" y="55" text-anchor="middle" font-size="26" font-weight="900"
+        transform="rotate(-90 {C} {C})"/>
+      <text x="{C}" y="62" text-anchor="middle" font-size="25" font-weight="900"
         fill="#F4EEFA" font-family="Vazir">{score:.0f}</text>
     </svg>'''
 
@@ -291,10 +322,10 @@ def _week_map(plan: list, active: int) -> str:
         </div>'''
     return f'<div class="week-map">{items}</div>'
 
-def _pcard(num: str, title: str, body: str, color: str, extra_cls: str = '') -> str:
+def _pcard(icon: str, title: str, body: str, color: str, extra_cls: str = '') -> str:
     return f'''<div class="pcard {extra_cls}">
       <div class="pcard-h">
-        <span class="pcard-n" style="color:{color};background:{color}1c;border:1px solid {color}55">{num}</span>
+        <span class="pcard-n" style="background:{color}1c;border:1px solid {color}55">{_icon_svg(icon, color)}</span>
         <span class="pcard-t">{title}</span>
       </div>{body}</div>'''
 
@@ -359,16 +390,16 @@ def _week_page(plan: list, idx: int, person_block: str, date_str: str) -> str:
       <div class="wk-status">{t['status']}</div>
       <div class="wk-band" style="color:{c};border-color:{c}55;background:{c}14">امتیاز {band_range} · {band_name}</div>
     </div>
-    <div class="wk-ring">{_score_ring(score, c)}</div>
+    <div class="wk-ring">{_score_ring(score, c, CHAKRA_PETALS[k])}</div>
   </div>
 
   <div class="pgrid">
-    {_pcard('۱', 'خواب', sleep, c)}
-    {_pcard('۲', 'آب و بارورسازی آب', water, c)}
-    {_pcard('۳', 'تمرین آگاهانه', practice, c)}
-    {_pcard('۴', 'موسیقی و فرکانس', music, c)}
-    {_pcard('۵', 'رایحه و عود', scent, c, 'span2')}
-    {_pcard('۶', 'الگوی غذایی', food, c, 'span2')}
+    {_pcard('sleep', 'خواب', sleep, c)}
+    {_pcard('water', 'آب و بارورسازی آب', water, c)}
+    {_pcard('practice', 'تمرین آگاهانه', practice, c)}
+    {_pcard('music', 'موسیقی و فرکانس', music, c)}
+    {_pcard('scent', 'رایحه و عود', scent, c, 'span2')}
+    {_pcard('food', 'الگوی غذایی', food, c, 'span2')}
   </div>
 
   <div class="foot">
@@ -514,8 +545,8 @@ html,body{{font-family:'Vazir',sans-serif;color:#F4EEFA;background:#0f0b18;-webk
 .pcard{{background:#ffffff07;border:1px solid #ffffff12;border-radius:14px;padding:13px 15px}}
 .pcard.span2{{grid-column:1 / -1}}
 .pcard-h{{display:flex;align-items:center;gap:9px;margin-bottom:9px}}
-.pcard-n{{width:22px;height:22px;border-radius:7px;display:flex;align-items:center;justify-content:center;
-   font-size:11.5px;font-weight:900;flex-shrink:0}}
+.pcard-n{{width:24px;height:24px;border-radius:7px;display:flex;align-items:center;justify-content:center;flex-shrink:0}}
+.pcard-n svg{{display:block}}
 .pcard-t{{font-size:13px;font-weight:700;color:#efe8fb}}
 .ln{{font-size:11px;color:#b7abd0;line-height:1.85}}
 .ln.em{{color:#e6dcf7;font-weight:700}}
