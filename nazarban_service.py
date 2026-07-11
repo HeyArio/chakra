@@ -3,6 +3,7 @@
 Usage: python3 nazarban_service.py <input_xlsx> <output_pdf> [person_name] [date_str]
 """
 import sys, os, json, math, html, statistics
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 import openpyxl, warnings
 from openpyxl.utils import column_index_from_string
@@ -49,6 +50,36 @@ ARCHETYPE_FA = {
     'Builder': 'سازنده', 'Creator': 'خالق', 'Leader': 'رهبر', 'Healer': 'شفادهنده',
     'Messenger': 'پیام‌رسان', 'Visionary': 'بینا', 'Mystic': 'عارف',
 }
+
+# ===== Jalali date =====
+
+_J_MONTHS = ['فروردین', 'اردیبهشت', 'خرداد', 'تیر', 'مرداد', 'شهریور',
+             'مهر', 'آبان', 'آذر', 'دی', 'بهمن', 'اسفند']
+_FA_DIGITS = str.maketrans('0123456789', '۰۱۲۳۴۵۶۷۸۹')
+
+def _greg_to_jalali(gy: int, gm: int, gd: int) -> tuple[int, int, int]:
+    """Standard civil Gregorian -> Jalali conversion (jdf algorithm)."""
+    g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    gy2 = gy - 1600
+    days = (365 * gy2 + (gy2 + 3) // 4 - (gy2 + 99) // 100 + (gy2 + 399) // 400
+            - 80 + gd + g_d_m[gm - 1])
+    if gm > 2 and ((gy % 4 == 0 and gy % 100 != 0) or gy % 400 == 0):
+        days += 1
+    jy = 979 + 33 * (days // 12053); days %= 12053
+    jy += 4 * (days // 1461);        days %= 1461
+    if days > 365:
+        jy += (days - 1) // 365
+        days = (days - 1) % 365
+    jm = 1 + days // 31 if days < 186 else 7 + (days - 186) // 30
+    jd = 1 + (days % 31 if days < 186 else (days - 186) % 30)
+    return jy, jm, jd
+
+def today_jalali() -> str:
+    """Today's Jalali date in Iran time (UTC+3:30), e.g. '۲۰ تیر ۱۴۰۵'."""
+    now = datetime.now(timezone(timedelta(hours=3, minutes=30)))
+    jy, jm, jd = _greg_to_jalali(now.year, now.month, now.day)
+    return f'{jd} {_J_MONTHS[jm - 1]} {jy}'.translate(_FA_DIGITS)
+
 
 def level_band(score: Optional[float]) -> tuple[str, str]:
     """Client's IF bands from Calculations!D column."""
@@ -409,6 +440,7 @@ def _week_page(plan: list, idx: int, person_block: str, date_str: str) -> str:
 </div>'''
 
 def build_html(data: dict, fonts_b64: dict, person_name: str = '', date_str: str = '') -> str:
+    date_str = date_str or today_jalali()  # auto-stamp the render date (Jalali, Iran time)
     m=data['metrics']
     chak=data['chakras']
     chaklab = CHAKRA_LABEL
