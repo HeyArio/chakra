@@ -84,7 +84,7 @@ One sheet, one row per respondent. Columns:
 - `A` response link · `B` respondent id
 - `C … BT` — the **70 questions**, each cell holding the chosen answer as **text** (not a number)
 - `BU` — «نام و نام خانوادگی …» → the respondent's **name** (drives the report + filename)
-- `BV` / `BW` — start / finish timestamps (Jalali)
+- `BV` / `BW` — start / finish timestamps (Jalali); the **finish** time (`BW`) is stamped on the report as its date (falls back to `BV`, then today)
 
 This file carries **no scoring information** — just the answers, the name and the dates.
 

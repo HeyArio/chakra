@@ -80,6 +80,22 @@ def today_jalali() -> str:
     jy, jm, jd = _greg_to_jalali(now.year, now.month, now.day)
     return f'{jd} {_J_MONTHS[jm - 1]} {jy}'.translate(_FA_DIGITS)
 
+_FA2EN = str.maketrans('۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩', '01234567890123456789')
+
+def jalali_display(raw) -> str:
+    """Format a Porsline Jalali datetime string ('1405/04/23-18:51:53', digits
+    Latin or Persian) as the report's date style '۲۳ تیر ۱۴۰۵'. '' if unparseable."""
+    if not raw:
+        return ''
+    s = str(raw).translate(_FA2EN)
+    m = re.match(r'\s*(\d{3,4})\s*/\s*(\d{1,2})\s*/\s*(\d{1,2})', s)
+    if not m:
+        return ''
+    jy, jm, jd = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if not 1 <= jm <= 12:
+        return ''
+    return f'{jd} {_J_MONTHS[jm - 1]} {jy}'.translate(_FA_DIGITS)
+
 
 def level_band(score: Optional[float]) -> tuple[str, str]:
     """v2 workbook bands (Calculations!C / Interpretation sheet).
@@ -281,6 +297,8 @@ def score_survey(path: str) -> dict:
         'person_name': pors['name'],
         'start_date': pors['start_date'],
         'end_date': pors['end_date'],
+        # report date = survey completion time (BW), falling back to start (BV)
+        'report_date': jalali_display(pors['end_date']) or jalali_display(pors['start_date']),
     }
 
 
@@ -646,7 +664,8 @@ def _week_page(plan: list, idx: int, person_block: str, date_str: str) -> str:
 </div>'''
 
 def build_html(data: dict, fonts_b64: dict, person_name: str = '', date_str: str = '') -> str:
-    date_str = date_str or today_jalali()  # auto-stamp the render date (Jalali, Iran time)
+    # date: explicit arg wins; else the survey's completion date; else today (Iran time)
+    date_str = date_str or data.get('report_date') or today_jalali()
     m=data['metrics']
     chak=data['chakras']
     chaklab = CHAKRA_LABEL
