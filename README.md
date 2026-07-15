@@ -20,22 +20,21 @@ editorial report design.
 
 ```
 Owner (Telegram)
-   │  1. sends the Porsline survey .xlsx
+   │  1. sends the Porsline survey .xlsx (one file, or 50)
    ▼
-n8n (cloud)  ──2. POST /upload (file + chat_id)──►  VPS service  ──stashes file by chat_id
-   │
-n8n  ──3. POST /render (chat_id)──►  VPS  ──reads name from file, scores, renders PDF──►  returns PDF
-   │  4. bot sends <name>.pdf back into the chat
+n8n (cloud)  ──2. POST /report (file)──►  VPS service
+   │                                        reads name from file → scores → renders PDF → returns it
+   │  3. bot sends <name>.pdf back into the chat
    ▼
 Owner receives the report
 ```
 
 - **Only the owner uses the bot.** It's single-user by design.
-- **No "who is this for?" step anymore** — the respondent's name is a field in the survey
-  (column `BU`), so the service reads it from the uploaded file and uses it as both the
-  in-report name and the PDF filename. (An explicit `name` can still be POSTed to override it.)
-- Upload and render are linked by **Telegram chat ID** — the VPS remembers the last uploaded
-  file per chat. n8n holds no state and needs no Code nodes.
+- **No "who is this for?" step** — the respondent's name is a field in the survey (column `BU`),
+  so the service reads it from the uploaded file and uses it as both the in-report name and the
+  PDF filename. (An explicit `name` can still be POSTed to override it.)
+- **One stateless call per file** (`/report`). Nothing is keyed by chat, so a burst of files
+  can't overwrite each other — send 50 and they all come back. n8n holds no state, no Code nodes.
 
 ---
 
@@ -191,29 +190,42 @@ The unit sets `NAZARBAN_TOKEN` and runs:
 
 ## The n8n workflow
 
-Import `chakra_bot_workflow.json` into n8n Cloud. Because the name no longer has to be typed,
-the flow is now a straight line with no second round-trip:
+Import `chakra_bot_workflow.json` into n8n Cloud. Since the name no longer has to be typed, the
+flow is four nodes in a straight line — no prompt, no second round-trip, and **safe to run many
+at once**:
 
-1. **Telegram Trigger** — Download Files ON.
-2. **Is it a file?** (IF) — TRUE = a document arrived → continue. FALSE = ignore.
-3. **Upload file to VPS** (HTTP) — POST `/upload` with the xlsx binary + `chat` id.
-4. **Generate PDF (VPS)** (HTTP) — POST `/render` with just the `chat` id; the VPS reads the
-   name from the file. (No `name` field needed.)
-5. **Send PDF Report** (Telegram) — sends the `<name>.pdf` into the chat.
-
-> Even simpler: steps 3–4 can collapse into a single **POST `/report`** with the file and no
-> `name` — one HTTP call, file in, PDF out. The upload/render split only matters if you want
-> the two-message pattern for some other reason.
+1. **Telegram Trigger** — Download Files ON. Each uploaded file is its own message.
+2. **Is it a file?** (IF) — TRUE = a document → render it. FALSE = plain text → ignored.
+3. **Render PDF (VPS)** (HTTP) — POST `/report` with the xlsx binary. The VPS reads the name
+   from the file (column `BU`), scores it and returns the PDF. **Stateless** — no `chat`/`name`
+   passed, so concurrent calls never collide.
+4. **Send PDF Report** (Telegram) — sends the `<name>.pdf` back into the chat.
 
 ### Config after import
-- Attach the Telegram bot credential (BotFather token) to the 3 Telegram nodes.
-- Set `X-Auth-Token` = your `NAZARBAN_TOKEN` in the 2 HTTP nodes.
-- URLs are pre-filled with the VPS IP (`185.221.237.90:8099`).
+- Attach the Telegram bot credential (BotFather token) to the 2 Telegram nodes.
+- Set `X-Auth-Token` = your `NAZARBAN_TOKEN` in the HTTP node.
+- URL is pre-filled with the VPS IP (`185.221.237.90:8099`).
 - Activate.
 
+### Many files at once (batches)
+Telegram delivers each file as a separate message, so 50 files = 50 independent executions, each
+its own `/report` call. Because `/report` is stateless (nothing is keyed by chat), they can't
+overwrite each other — unlike the old `/upload`+`/render` pair, which kept **one stashed file per
+chat** and would clobber itself under concurrency.
+
+Throughput is bounded by PDF rendering on the VPS: **~2.4 s per file** (Chromium render; scoring
+itself is ~0.1 s). With the default `gunicorn -w 2`, two render in parallel, so ~50 files drain in
+about a minute. To go faster, raise the worker count (`-w 4`) if the VPS has the RAM — budget
+~250–300 MB per concurrent Chromium. n8n Cloud's own execution-concurrency cap naturally paces the
+requests, so the VPS won't be stampeded.
+
 ### Design decisions worth knowing
-- **No Code nodes.** They're flaky on n8n Cloud and caused an "unknown error" earlier.
-  All state moved to the VPS (keyed by chat id); n8n only passes values it reads natively.
+- **No Code nodes.** They're flaky on n8n Cloud and caused an "unknown error" earlier. n8n only
+  passes values it reads natively; all the logic lives on the VPS.
+- **Stateless render.** The bot now uses the one-shot `/report` (file in → PDF out) instead of
+  the `/upload`+`/render` stash. Nothing is keyed by chat, so nothing can be clobbered when files
+  arrive together. (`/upload` + `/render` are still in the service for the old two-message
+  pattern, but the bot no longer uses them.)
 - **No name prompt.** The respondent's name is a field inside the survey (column `BU`), so the
   VPS reads it from the uploaded file. This removed the old "who is this for?" message, the
   second Telegram execution, and the state-matching that went with it.

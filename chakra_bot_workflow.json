@@ -1,0 +1,189 @@
+{
+  "name": "Chakra Report Bot",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {
+          "download": true
+        }
+      },
+      "id": "75d005ab-7205-4e9e-a9ba-3f35cfce2268",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -464,
+        144
+      ],
+      "webhookId": "chakra-report-bot",
+      "credentials": {
+        "telegramApi": {
+          "id": "cWt2loWBfcYWXkku",
+          "name": "Chakra bot"
+        }
+      },
+      "notes": "Download Files ON. Each uploaded .xlsx arrives as its own message, so sending 50 files = 50 independent executions (no name reply needed anymore)."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-doc",
+              "leftValue": "={{ $json.message.document }}",
+              "rightValue": "",
+              "operator": {
+                "type": "object",
+                "operation": "exists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c169a557-ddc3-40e8-b306-7050b08c66b7",
+      "name": "Is it a file?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -224,
+        144
+      ],
+      "notes": "TRUE = a document arrived -> render it. FALSE = plain text -> ignored (no name step anymore)."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://185.221.237.90:8099/report",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Auth-Token",
+              "value": "CHANGE_THIS_TOKEN"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "data"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "id": "4634e97e-976f-4c62-beac-a36550e18d0a",
+      "name": "Render PDF (VPS)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        16,
+        144
+      ],
+      "notes": "One-shot: sends the .xlsx, VPS reads the name from the file (column BU), scores it and returns the PDF as binary 'data'. Stateless -> safe to run many in parallel. Set X-Auth-Token to your VPS token. No 'name' field needed (pass one only to override)."
+    },
+    {
+      "parameters": {
+        "operation": "sendDocument",
+        "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
+        "binaryData": true,
+        "additionalFields": {
+          "caption": "گزارش تحلیل انرژی شما آماده است 🌿\nChakra · Nazarbanai"
+        }
+      },
+      "id": "58d094a5-20f0-4b4e-9944-13c8016d38d8",
+      "name": "Send PDF Report",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        256,
+        144
+      ],
+      "webhookId": "5aea1501-058c-4ba4-8992-62bb13f0b313",
+      "credentials": {
+        "telegramApi": {
+          "id": "cWt2loWBfcYWXkku",
+          "name": "Chakra bot"
+        }
+      },
+      "notes": "Sends the finished PDF back. Filename (<name>.pdf) comes from the VPS Content-Disposition header."
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Is it a file?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is it a file?": {
+      "main": [
+        [
+          {
+            "node": "Render PDF (VPS)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Render PDF (VPS)": {
+      "main": [
+        [
+          {
+            "node": "Send PDF Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false
+  },
+  "versionId": "eee94bb5-b806-4a4a-87c6-3df39d2b7d9a",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "d744e477ef36c482af21417c5323cfd0ec139dc4dc3b252b940a1eb9cd25aabf"
+  },
+  "id": "F4Rt4bHPWaasAK7x",
+  "tags": [
+    {
+      "updatedAt": "2026-07-07T18:18:01.184Z",
+      "createdAt": "2026-07-07T18:18:01.184Z",
+      "id": "Ee29V5AX7baOMFZI",
+      "name": "chakra"
+    }
+  ]
+}

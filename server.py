@@ -13,7 +13,7 @@ Endpoints:
 
 Pending uploads live in a temp dir, one slot per chat, auto-expire after TTL.
 """
-import os, tempfile, json, re, time, logging
+import os, tempfile, shutil, json, re, time, logging
 from flask import Flask, request, send_file, jsonify
 
 import nazarban_service as svc
@@ -57,6 +57,9 @@ def _render_response(in_path, name, date=''):
     resp.headers['X-Overall'] = str(data['overall_score'])
     resp.headers['X-Dominant'] = data['dominant']
     resp.headers['X-Archetype'] = data['archetype']
+    # remove the rendered PDF once the response has been streamed (matters when
+    # many files are processed back-to-back — otherwise temp dirs pile up)
+    resp.call_on_close(lambda: shutil.rmtree(td, ignore_errors=True))
     return resp
 
 def _sweep():
@@ -79,14 +82,23 @@ def report():
         return jsonify(ok=False, error='unauthorized'), 401
     if 'file' not in request.files:
         return jsonify(ok=False, error='no file field'), 400
+    f = request.files['file']
+    if not f.filename or not f.filename.lower().endswith('.xlsx'):
+        return jsonify(ok=False, error='only .xlsx files accepted'), 400
+    head = f.stream.read(4)
+    f.stream.seek(0)
+    if head[:2] != b'PK':
+        return jsonify(ok=False, error='invalid xlsx file'), 400
     name = request.form.get('name', '')
     with tempfile.TemporaryDirectory() as td:
         in_path = os.path.join(td, 'in.xlsx')
-        request.files['file'].save(in_path)
+        f.save(in_path)
         try:
-            return _render_response(in_path, name)
+            resp = _render_response(in_path, name)
+            log.info('report ok file=%s', f.filename)
+            return resp
         except Exception as e:
-            log.exception('report failed')
+            log.exception('report failed file=%s', f.filename)
             return jsonify(ok=False, error=str(e)), 500
 
 @app.route('/upload', methods=['POST'])
