@@ -1,9 +1,15 @@
 # Chakra — Telegram Energy/Chakra Report Bot
 
-A Telegram bot that turns a filled 140-question chakra/energy survey (`.xlsx`) into a
-branded PDF report (wordmark: «شاهراه ثروت»). The owner uploads the spreadsheet, the bot asks who
-it's for, and sends back a polished 6-page PDF named after that person: 2 analysis pages
-plus a personalized **4-week energy growth & balance program** (one chakra per week).
+A Telegram bot that turns a filled 70-question chakra/energy survey (`.xlsx`) into a
+branded PDF report (wordmark: «شاهراه ثروت»). The owner uploads the spreadsheet and the bot
+sends back a polished 6-page PDF **named after the respondent** — the person's name is read
+straight out of the survey, so nobody has to type it. The report is 2 analysis pages plus a
+personalized **4-week energy growth & balance program** (one chakra per week).
+
+The survey is a **Porsline** export (`Results` sheet) that contains only the answers, the
+person's name and the dates. The scoring model (questions, options, 1–4 scores, reverse
+flags, per-metric weights) lives in the bundled `scoring_model.xlsx`; the service maps each
+text answer back onto it to compute the scores.
 
 Built for **Nazarban Studio** / nazarbanai.com. Persian-first (RTL, Vazirmatn), dark
 editorial report design.
@@ -14,22 +20,22 @@ editorial report design.
 
 ```
 Owner (Telegram)
-   │  1. sends filled chakra.xlsx
+   │  1. sends the Porsline survey .xlsx
    ▼
 n8n (cloud)  ──2. POST /upload (file + chat_id)──►  VPS service  ──stashes file by chat_id
-   │  3. bot replies "who is this for?" (plain message)
-   ▼
-Owner types a name
    │
-n8n  ──4. POST /render (chat_id + name)──►  VPS  ──scores + builds HTML + renders PDF──►  returns PDF
-   │  5. bot sends <name>.pdf back into the chat
+n8n  ──3. POST /render (chat_id)──►  VPS  ──reads name from file, scores, renders PDF──►  returns PDF
+   │  4. bot sends <name>.pdf back into the chat
    ▼
 Owner receives the report
 ```
 
 - **Only the owner uses the bot.** It's single-user by design.
-- The two Telegram messages (file, then name) are linked by **Telegram chat ID** — the
-  VPS remembers the last uploaded file per chat. n8n holds no state and needs no Code nodes.
+- **No "who is this for?" step anymore** — the respondent's name is a field in the survey
+  (column `BU`), so the service reads it from the uploaded file and uses it as both the
+  in-report name and the PDF filename. (An explicit `name` can still be POSTed to override it.)
+- Upload and render are linked by **Telegram chat ID** — the VPS remembers the last uploaded
+  file per chat. n8n holds no state and needs no Code nodes.
 
 ---
 
@@ -61,44 +67,54 @@ workflow JSON to import lives here.
 | File | Runs on | Purpose |
 |------|---------|---------|
 | `server.py` | VPS | Flask HTTP service. Endpoints: `/health`, `/upload`, `/render`, `/report`. |
-| `nazarban_service.py` | VPS | The engine: reads the xlsx, scores it, builds the HTML report, renders the PDF. Scoring + template + renderer bundled; program copy lives in `program_content.py`. |
+| `nazarban_service.py` | VPS | The engine: reads the survey, scores it, builds the HTML report, renders the PDF. Scoring + template + renderer bundled; program copy lives in `program_content.py`. |
+| `scoring_model.xlsx` | VPS | **The scoring brain.** The client's master workbook: 70 questions, their 4 options, 1–4 scores, reverse flags, and per-metric weights. The uploaded survey carries only answers; this file supplies the model. Edit weights/options here → restart. Must sit next to `nazarban_service.py`. |
 | `program_content.py` | VPS | The 4-week program copy: 7 chakras × 3 score tiers × 6 sections (sleep, water affirmation, practice, frequency, incense, diet). Pure data — edit copy here, no logic. Must sit next to `nazarban_service.py`. |
 | `fonts_b64.json` | VPS | Vazirmatn font weights (Farsi-Digits variant), base64-embedded so the PDF has zero external font deps. Must sit next to `nazarban_service.py`. |
 | `requirements.txt` | VPS | Python deps: openpyxl, flask, gunicorn, playwright. |
 
 ---
 
-## The input file (`chakra.xlsx`)
+## The two files: survey input + scoring model
 
-The survey workbook has these sheets:
-- **README** — description, disclaimer (self-knowledge tool, not medical/financial advice).
-- **Questions** — 140 rows. Each: chakra, dimension, 4 options, per-option scores (1–4),
-  and multi-dimensional weights (7 chakras + 5 cross-indices: financial, emotional, health,
-  receptivity, intuition) + an archetype tag.
-- **Responses** — the answer sheet. Column B (`پاسخ (۱ تا ۴)`) is where 1–4 goes for each
-  of the 140 questions. **This is the only column the user fills.**
-- **Calculations / Dashboard / Interpretation / Archetypes** — the client's own scoring
-  model and copy. **Important:** the scoring formulas already exist here.
+The system uses **two** workbooks with a clean split of responsibility.
 
-### Scoring (do not reinvent)
-The engine replicates the client's own formulas exactly (verified to the decimal against
-LibreOffice). Per metric:
+### 1. The uploaded survey — a Porsline export (`Results` sheet)
+One sheet, one row per respondent. Columns:
+- `A` response link · `B` respondent id
+- `C … BT` — the **70 questions**, each cell holding the chosen answer as **text** (not a number)
+- `BU` — «نام و نام خانوادگی …» → the respondent's **name** (drives the report + filename)
+- `BV` / `BW` — start / finish timestamps (Jalali)
+
+This file carries **no scoring information** — just the answers, the name and the dates.
+
+### 2. `scoring_model.xlsx` — the scoring brain (bundled, not uploaded)
+The client's master workbook. Sheet `Questions` has 70 rows; each row: category, main chakra,
+question text, the 4 options (`گزینه ۱..۴`), a direct/reverse flag (`نوع امتیاز`: مستقیم/معکوس),
+and per-metric weights in columns `J..T` (7 chakras + 4 axes: Wealth, Emotional, Health,
+Receiving). Tune scoring by editing weights/options here, then restart the service.
+
+### How they join
+For each question the service matches the survey's answer **text** to one of the four options
+in the model → recovers the **1–4** choice. Text is normalized (ZWNJ, ی/ي, ک/ك, punctuation) so
+Porsline's encoding lines up with the master. Validated 70/70 against the client's real export.
+
+### Scoring (replicates the workbook exactly)
+Per question: `F = 5 − answer` if the question is `معکوس` (reverse), else `answer`. Per metric:
 
 ```
-score = (SUMPRODUCT(answers, weights, answered) - SUMPRODUCT(weights, answered))
-        / (3 * SUMPRODUCT(weights, answered)) * 100
+score = SUMPRODUCT(F, weight) / (4 · SUM(weight)) · 100
 ```
 
-i.e. a weighted 1–4 → 0–100 normalization that ignores blank answers. Plus:
+Then:
 - **7 chakra scores** (root, sacral, solar, heart, throat, third-eye, crown)
-- **5 cross-indices** (financial, emotional, health, receptivity, intuition)
-- **confidence** = % of questions answered
-- **balance** = 100 − population stdev of the 7 chakra scores
-- **dominant chakra** = highest of the 7 → maps to an **archetype**
+- **4 axes** (ثروت / wealth, عاطفی / emotional, سلامتی / health, دریافت / receiving)
+- **confidence** = % of questions answered · **balance** = 100 − population stdev of the 7 chakras
+- **dominant chakra** = highest of the 7 → **archetype**
   (Builder / Creator / Leader / Healer / Messenger / Visionary / Mystic)
-- **level bands**: <35 نیازمند توجه جدی · 35–54 کم‌تعادل · 55–74 متعادل نسبی · 75–100 نقطه قوت
+- **level bands**: <40 پرچالش · 40–59 نیازمند توجه · 60–77 متعادل نسبی · ≥78 قوی
 
-If you touch scoring, keep it matching the workbook's `Calculations` sheet.
+If you touch scoring, keep it matching `scoring_model.xlsx` (`Questions` + `Calculations`).
 
 ### The 4-week program (pages 3–6)
 
@@ -128,8 +144,12 @@ the systemd env). Returns 401 if it doesn't match.
 |--------|------|------|---------|
 | GET | `/health` | — | `{"ok":true,"service":"chakra-report"}` |
 | POST | `/upload` | multipart: `file` (xlsx), `chat` (chat id) | `{"ok":true,"chat":"..."}` — stashes the file keyed by chat |
-| POST | `/render` | form or JSON: `chat` (chat id), `name` | the PDF (`application/pdf`), one-time use — deletes the stash |
-| POST | `/report` | multipart: `file`, `name` | the PDF in one shot (no chat needed; kept for convenience) |
+| POST | `/render` | form or JSON: `chat` (chat id); `name` **optional** | the PDF (`application/pdf`), one-time use — deletes the stash |
+| POST | `/report` | multipart: `file`; `name` **optional** | the PDF in one shot (no chat needed; kept for convenience) |
+
+> `name` is optional: when omitted (or blank) the service reads the respondent's name from the
+> survey (column `BU`) and uses it for both the in-report name and the PDF filename. Pass `name`
+> only to override.
 
 Pending uploads live in `$TMPDIR/chakra_uploads/`, one slot per chat, auto-expire after
 30 min. Response headers `X-Overall`, `X-Dominant`, `X-Archetype` expose the summary.
@@ -171,14 +191,19 @@ The unit sets `NAZARBAN_TOKEN` and runs:
 
 ## The n8n workflow
 
-Import `chakra_bot_workflow.json` into n8n Cloud. Six nodes:
+Import `chakra_bot_workflow.json` into n8n Cloud. Because the name no longer has to be typed,
+the flow is now a straight line with no second round-trip:
 
-1. **Telegram Trigger** — Download Files ON. Both the file and the name-reply land here.
-2. **Is it a file?** (IF) — TRUE = a document arrived → upload path. FALSE = plain text = the name → render path.
+1. **Telegram Trigger** — Download Files ON.
+2. **Is it a file?** (IF) — TRUE = a document arrived → continue. FALSE = ignore.
 3. **Upload file to VPS** (HTTP) — POST `/upload` with the xlsx binary + `chat` id.
-4. **Ask for the name** (Telegram) — plain message: "who is this for?". No button, no link.
-5. **Generate PDF (VPS)** (HTTP) — POST `/render` with `chat` id + typed `name`, gets the PDF back.
-6. **Send PDF Report** (Telegram) — sends the PDF into the chat.
+4. **Generate PDF (VPS)** (HTTP) — POST `/render` with just the `chat` id; the VPS reads the
+   name from the file. (No `name` field needed.)
+5. **Send PDF Report** (Telegram) — sends the `<name>.pdf` into the chat.
+
+> Even simpler: steps 3–4 can collapse into a single **POST `/report`** with the file and no
+> `name` — one HTTP call, file in, PDF out. The upload/render split only matters if you want
+> the two-message pattern for some other reason.
 
 ### Config after import
 - Attach the Telegram bot credential (BotFather token) to the 3 Telegram nodes.
@@ -189,12 +214,13 @@ Import `chakra_bot_workflow.json` into n8n Cloud. Six nodes:
 ### Design decisions worth knowing
 - **No Code nodes.** They're flaky on n8n Cloud and caused an "unknown error" earlier.
   All state moved to the VPS (keyed by chat id); n8n only passes values it reads natively.
-- **No "Send and Wait for Response" node.** That node forces a button + external link,
-  which we explicitly didn't want. Instead the name is a normal message caught by the same
-  trigger on a second execution, matched to the pending file via chat id.
-- **Known harmless quirk:** if the owner sends random text with no file pending, the render
-  node errors ("no pending file", 404) in the execution log. It's benign. Add a guard later
-  if it's annoying.
+- **No name prompt.** The respondent's name is a field inside the survey (column `BU`), so the
+  VPS reads it from the uploaded file. This removed the old "who is this for?" message, the
+  second Telegram execution, and the state-matching that went with it.
+- **Answers are matched by text.** Porsline exports the chosen answer as text, not a 1–4 index,
+  so the service maps each answer back to its option in `scoring_model.xlsx`. Keep the option
+  wording in the survey identical to the master workbook (the matcher normalizes ZWNJ, ی/ي,
+  ک/ك and punctuation, but can't bridge genuinely different wording).
 
 ---
 
@@ -203,8 +229,9 @@ Import `chakra_bot_workflow.json` into n8n Cloud. Six nodes:
 Edit the report-builder section of `nazarban_service.py`:
 - **Colors** — `CHAKRA_COLOR` dict + the CSS palette at the top of the `<style>` block.
 - **Wordmark / tagline** — the `.brand` block in the HTML.
-- **Copy / interpretations** — `BAND_SUGGEST`, `ARCHE_DESC` (sourced from the workbook's
-  Interpretation and Archetypes sheets).
+- **Copy / interpretations** — `BAND_SUGGEST` (band advice) and `ARCHE_DESC` (archetype role +
+  shadow) live in `nazarban_service.py`. Band labels/thresholds follow `scoring_model.xlsx`
+  (`Interpretation` sheet); the chakra→archetype mapping is code-only (`ARCHETYPE`).
 - **Layout** — two `.page` divs (A4, fixed height). Signature element is the "energy spine"
   (vertical stack of 7 chakra bars). Restyled radar chart, per-chakra interpretation rows.
 

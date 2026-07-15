@@ -46,11 +46,14 @@ def _render_response(in_path, name, date=''):
     td = tempfile.mkdtemp()
     out_path = os.path.join(td, 'out.pdf')
     data = svc.score_workbook(in_path)
+    # The Porsline survey carries the respondent's name (column BU), so an
+    # explicitly-typed name is optional now: fall back to the one in the file.
+    person = (name or '').strip() or data.get('person_name', '')
     fonts = svc._load_fonts()
-    html_str = svc.build_html(data, fonts, person_name=name, date_str=date)
+    html_str = svc.build_html(data, fonts, person_name=person, date_str=date)
     svc.render_html_to_pdf(html_str, out_path)
     resp = send_file(out_path, mimetype='application/pdf',
-                     as_attachment=True, download_name=_safe_name(name))
+                     as_attachment=True, download_name=_safe_name(person))
     resp.headers['X-Overall'] = str(data['overall_score'])
     resp.headers['X-Dominant'] = data['dominant']
     resp.headers['X-Archetype'] = data['archetype']

@@ -2,7 +2,7 @@
 """Nazarban report service for n8n.
 Usage: python3 nazarban_service.py <input_xlsx> <output_pdf> [person_name] [date_str]
 """
-import sys, os, json, math, html, statistics
+import sys, os, re, json, math, html, statistics
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import openpyxl, warnings
@@ -36,8 +36,8 @@ CHAKRA_LABEL = {
     'throat': 'گلو', 'thirdeye': 'چشم سوم', 'crown': 'تاج',
 }
 INDEX_LABEL = {
-    'financial': 'مالی', 'emotional': 'عاطفی', 'health': 'سلامت',
-    'receptivity': 'دریافت', 'intuition': 'شهود',
+    'financial': 'ثروت', 'emotional': 'عاطفی', 'health': 'سلامتی',
+    'receptivity': 'دریافت', 'intuition': 'شهود',  # v2 axis names (intuition kept for legacy)
 }
 FA = {**CHAKRA_LABEL, **INDEX_LABEL}
 
@@ -82,15 +82,221 @@ def today_jalali() -> str:
 
 
 def level_band(score: Optional[float]) -> tuple[str, str]:
-    """Client's IF bands from Calculations!D column."""
+    """v2 workbook bands (Calculations!C / Interpretation sheet).
+    <40 پرچالش · <60 نیازمند توجه · <78 متعادل نسبی · ≥78 قوی.
+    Internal keys kept stable (needs_attention/low/moderate/strength) so the
+    report CSS + suggestion copy don't have to change."""
     if score is None:
         return ('', '')
-    if score < 35:  return ('نیازمند توجه جدی', 'needs_attention')
-    if score < 55:  return ('کم‌تعادل',          'low')
-    if score < 75:  return ('متعادل نسبی',        'moderate')
-    return ('نقطه قوت', 'strength')
+    if score < 40:  return ('پرچالش',       'needs_attention')
+    if score < 60:  return ('نیازمند توجه',  'low')
+    if score < 78:  return ('متعادل نسبی',   'moderate')
+    return ('قوی', 'strength')
+
+# ===== v2 survey scoring (Porsline export + bundled scoring model) =====
+# The bot now receives a Porsline survey export (single "Results" sheet)
+# that carries ONLY the questionnaire answers (as text) plus the person's
+# name and dates. The scoring brain — questions, the four options, 1-4
+# scores, reverse flags and per-metric weights — lives in the bundled
+# master workbook `scoring_model.xlsx` (the client's own file, the single
+# source of truth). We map each text answer back to its 1-4 option and
+# apply the workbook's exact formulas:
+#     F      = 5-answer if question is معکوس (reverse) else answer
+#     metric = SUMPRODUCT(F, weight) / (4 * SUM(weight)) * 100
+
+SCORING_MODEL_FILE = 'scoring_model.xlsx'
+
+# master Questions weight columns J..T  ->  report metric keys
+# (financial=Wealth/ثروت, receptivity=Receiving/دریافت — v2 has no intuition)
+_MODEL_METRIC_COL = {
+    'root': 'J', 'sacral': 'K', 'solar': 'L', 'heart': 'M', 'throat': 'N',
+    'thirdeye': 'O', 'crown': 'P',
+    'financial': 'Q', 'emotional': 'R', 'health': 'S', 'receptivity': 'T',
+}
+SURVEY_METRICS = list(_MODEL_METRIC_COL)  # 7 chakras + 4 axes
+
+_ZW = ['‌', '‍', '‎', '‏', '﻿', '\xa0']
+
+def _norm_fa(s) -> str:
+    """Normalize Persian text for robust matching: strip ZWNJ/joiners, unify
+    ی/ي and ک/ك and alef forms, drop incidental punctuation, collapse spaces."""
+    if s is None:
+        return ''
+    s = str(s)
+    for z in _ZW:
+        s = s.replace(z, ' ')
+    s = (s.replace('ي', 'ی').replace('ك', 'ک').replace('ۀ', 'ه')
+           .replace('ة', 'ه').replace('أ', 'ا').replace('إ', 'ا').replace('آ', 'ا'))
+    s = re.sub(r'[؟?.…،,!:;«»"\'()\-]', ' ', s)
+    return re.sub(r'\s+', ' ', s).strip()
+
+_MODEL_CACHE = None
+
+def _load_scoring_model() -> list:
+    """Parse the bundled master workbook once. Returns one dict per question:
+    normalized question text, normalized options, reverse flag, weights."""
+    global _MODEL_CACHE
+    if _MODEL_CACHE is not None:
+        return _MODEL_CACHE
+    path = os.path.join(_HERE, SCORING_MODEL_FILE)
+    wb = openpyxl.load_workbook(path, data_only=True)
+    q = wb['Questions']
+    cols = {k: column_index_from_string(v) for k, v in _MODEL_METRIC_COL.items()}
+    out = []
+    for row in range(2, q.max_row + 1):
+        qtext = q.cell(row, 4).value                      # D سؤال
+        if qtext is None or str(qtext).strip() == '':
+            continue
+        opts = [q.cell(row, c).value for c in (5, 6, 7, 8)]  # E-H گزینه ۱..۴
+        stype = q.cell(row, 9).value                          # I نوع امتیاز
+        weights = {k: float(q.cell(row, ci).value or 0) for k, ci in cols.items()}
+        out.append({
+            'q_norm': _norm_fa(qtext),
+            'opt_norm': [_norm_fa(o) for o in opts],
+            'reverse': 'معکوس' in str(stype or ''),
+            'weights': weights,
+        })
+    if not out:
+        raise RuntimeError('scoring_model.xlsx contains no questions')
+    _MODEL_CACHE = out
+    return out
+
+# Porsline "Results" header keywords used to locate the special columns
+_P_NAME_KEY = 'نام و نام خانوادگی'
+_P_SKIP_HDRS = ('پاسخنامه', 'شناسه پاسخ دهنده')
+
+def read_porsline(path: str) -> dict:
+    """Read a Porsline survey export ("Results" sheet). Returns the person's
+    name + start/end dates and a {normalized-question -> answer-text} map.
+    One uploaded file = one respondent (first populated data row)."""
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb['Results']
+    header = [c.value for c in ws[1]]
+    data_row = None
+    for r in range(2, ws.max_row + 1):
+        if any(ws.cell(r, c).value not in (None, '') for c in range(1, ws.max_column + 1)):
+            data_row = r
+            break
+    if data_row is None:
+        raise RuntimeError('Porsline export has no response row')
+    name = start = end = None
+    answers = {}
+    for c in range(1, ws.max_column + 1):
+        h = header[c - 1]
+        if h is None or str(h).strip() == '':
+            continue
+        hs = str(h)
+        val = ws.cell(data_row, c).value
+        if _P_NAME_KEY in hs:
+            name = val
+        elif 'تاریخ شروع' in hs:
+            start = val
+        elif 'تاریخ اتمام' in hs:
+            end = val
+        elif any(k in hs for k in _P_SKIP_HDRS):
+            continue
+        else:
+            answers[_norm_fa(hs)] = val
+    return {
+        'name': str(name).strip() if name not in (None, '') else '',
+        'start_date': str(start).strip() if start not in (None, '') else '',
+        'end_date': str(end).strip() if end not in (None, '') else '',
+        'answers': answers,
+    }
+
+def _match_option(ans_norm: str, opts_norm: list) -> Optional[int]:
+    """Return the 0-based option index for an answer text, or None."""
+    if not ans_norm:
+        return None
+    for i, on in enumerate(opts_norm):
+        if on == ans_norm:
+            return i
+    for i, on in enumerate(opts_norm):   # tolerant containment fallback
+        if on and (on in ans_norm or ans_norm in on):
+            return i
+    return None
+
+def score_survey(path: str) -> dict:
+    """Score a Porsline export against the bundled v2 scoring model and
+    return the same data shape build_html() consumes, plus person/dates."""
+    model = _load_scoring_model()
+    pors = read_porsline(path)
+    ans_by_q = pors['answers']
+
+    total = len(model)
+    resolved = []          # (question, F-score 1..4 reverse-adjusted or None)
+    unmatched = []
+    for m in model:
+        idx = _match_option(_norm_fa(ans_by_q.get(m['q_norm'])), m['opt_norm'])
+        if idx is None:
+            unmatched.append(m['q_norm'])
+            resolved.append((m, None))
+            continue
+        ans = idx + 1
+        resolved.append((m, (5 - ans) if m['reverse'] else ans))
+    answered = sum(1 for _, f in resolved if f is not None)
+    if unmatched:
+        print(json.dumps({'warn': 'unmatched_answers', 'count': len(unmatched)},
+                         ensure_ascii=False), file=sys.stderr)
+
+    def metric_score(key):
+        num = wsum = 0.0
+        for m, f in resolved:
+            w = m['weights'][key]
+            wsum += w
+            if f is not None:
+                num += f * w
+        if wsum == 0:
+            return 0.0
+        return round(num / (4 * wsum) * 100, 1)
+
+    scores = {k: metric_score(k) for k in SURVEY_METRICS}
+    confidence = round(answered / total * 100, 1) if total else 0.0
+
+    chakra_vals = [scores[k] for k in CHAKRA_KEYS]
+    balance = round(100 - statistics.pstdev(chakra_vals), 1) if len(chakra_vals) == 7 else None
+    dominant = max(CHAKRA_KEYS, key=lambda k: scores[k] if scores[k] is not None else -1)
+    arche = ARCHETYPE[dominant]
+
+    detail = {}
+    for k, v in scores.items():
+        band_fa, band_key = level_band(v)
+        detail[k] = {'label_fa': FA[k], 'score': v, 'level_fa': band_fa, 'level': band_key}
+
+    overall = round(sum(chakra_vals) / len(chakra_vals), 1) if chakra_vals else None
+
+    return {
+        'metrics': detail,
+        'chakras': {k: scores[k] for k in CHAKRA_KEYS},
+        'indices': {k: scores[k] for k in INDEX_ORDER},
+        'overall_score': overall,
+        'confidence': confidence,
+        'answered': answered,
+        'total_questions': total,
+        'balance': balance,
+        'dominant': dominant,
+        'dominant_fa': FA[dominant],
+        'archetype': arche,
+        'archetype_fa': ARCHETYPE_FA[arche],
+        'person_name': pors['name'],
+        'start_date': pors['start_date'],
+        'end_date': pors['end_date'],
+    }
+
 
 def score_workbook(path: str) -> dict:
+    """Dispatch on file shape: a Porsline export (single 'Results' sheet) goes
+    through the v2 survey scorer; a legacy Questions/Responses workbook goes
+    through the original engine."""
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    sheets = set(wb.sheetnames)
+    wb.close()
+    if 'Results' in sheets:
+        return score_survey(path)
+    return _score_legacy_workbook(path)
+
+
+def _score_legacy_workbook(path: str) -> dict:
     wb = openpyxl.load_workbook(path, data_only=True)
     q = wb['Questions']
     r = wb['Responses']
@@ -195,7 +401,7 @@ CHAKRA_COLOR = {
     'root':'#E5484D','sacral':'#F2802B','solar':'#F5C542','heart':'#4FB477',
     'throat':'#3DA5D9','thirdeye':'#6A6AE3','crown':'#A65FD9',
 }
-INDEX_ORDER = ['financial','emotional','health','receptivity','intuition']
+INDEX_ORDER = ['financial','emotional','health','receptivity']  # v2: 4 axes (no intuition)
 INDEX_COLOR = '#8b7fb5'
 
 ARCHE_DESC = {  # from client's Archetypes sheet: positive role + shadow
@@ -215,8 +421,8 @@ BAND_SUGGEST = {
     'strength':        'استفاده آگاهانه از این قوت برای حمایت از حوزه‌های ضعیف‌تر.',
 }
 BAND_LABEL = {
-    'needs_attention':'نیازمند توجه جدی','low':'کم‌تعادل',
-    'moderate':'متعادل نسبی','strength':'نقطه قوت',
+    'needs_attention':'پرچالش','low':'نیازمند توجه',
+    'moderate':'متعادل نسبی','strength':'قوی',
 }
 
 def _radar_svg(chakras: dict) -> str:
@@ -689,7 +895,7 @@ html,body{{font-family:'Vazir',sans-serif;color:#F4EEFA;background:#0f0b18;-webk
   </div>
 
   <div class="foot">
-    <div class="disc">نتایج بر اساس پاسخ‌های ثبت‌شده در پرسشنامه ۱۴۰ سؤالی تولید شده‌اند. برای اعتبار بیشتر، پاسخ‌ها را کامل و صادقانه تکمیل کنید.</div>
+    <div class="disc">نتایج بر اساس پاسخ‌های ثبت‌شده در پرسشنامه ۷۰ سؤالی تولید شده‌اند. برای اعتبار بیشتر، پاسخ‌ها را کامل و صادقانه تکمیل کنید.</div>
     <div class="foot-brand">شاهراه ثروت</div>
   </div>
 </div>
