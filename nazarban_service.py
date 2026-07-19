@@ -979,7 +979,7 @@ def render_reports(datas: list, out_dir: str, name_override: str = '',
     is exactly one respondent — a batch reads every name from the file.
     Returns [(pdf_path, person_name, data), ...] in file order."""
     fonts = _load_fonts()
-    jobs, meta, used = [], [], set()
+    meta, used = [], set()
     for i, data in enumerate(datas, 1):
         person = (name_override or '').strip() if len(datas) == 1 else ''
         person = person or data.get('person_name', '') or f'respondent-{i}'
@@ -988,10 +988,13 @@ def render_reports(datas: list, out_dir: str, name_override: str = '',
         while fname in used:
             fname, n = f'{stem}_{n}.pdf', n + 1
         used.add(fname)
-        pdf_path = os.path.join(out_dir, fname)
-        jobs.append((build_html(data, fonts, person_name=person,
-                                date_str=date_str), pdf_path))
-        meta.append((pdf_path, person, data))
+        meta.append((os.path.join(out_dir, fname), person, data))
+    # build each HTML lazily inside the render loop: every page embeds ~850 KB
+    # of base64 fonts, so materializing a whole batch up front would grow peak
+    # memory linearly with the batch size
+    jobs = ((build_html(data, fonts, person_name=person, date_str=date_str),
+             pdf_path)
+            for pdf_path, person, data in meta)
     with sync_playwright() as p:
         b = p.chromium.launch(args=['--no-sandbox'])
         _render_pages(b, jobs)

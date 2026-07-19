@@ -32,13 +32,19 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 log = logging.getLogger('chakra')
 
 STORE_DIR = os.path.join(tempfile.gettempdir(), 'chakra_uploads')
+RENDER_DIR = os.path.join(tempfile.gettempdir(), 'chakra_render')
 os.makedirs(STORE_DIR, exist_ok=True)
+os.makedirs(RENDER_DIR, exist_ok=True)
 UPLOAD_TTL = 1800  # 30 min
-# Largest batch rendered in one request. Rendering is ~1s per PDF, but the
-# binding limit is Telegram: each PDF is ~1.3 MB (embedded fonts), and a bot
-# can send at most 50 MB — 35 keeps the ZIP safely under that. A bigger
-# export should be split in Porsline before uploading.
-MAX_BATCH = 35
+# Largest batch rendered in one request. Two ceilings, measured:
+#   * Telegram: a bot can send at most 50 MB, and each PDF is ~1.26 MB raw /
+#     ~1.0 MB zipped -> ~48 people is the hard wall, 40 keeps 20% headroom.
+#   * gunicorn --timeout: a batch renders at ~1.4 s/PDF on the VPS, ~2.8 s
+#     if both workers render batches at once. --timeout 120 therefore only
+#     covers ~35 under contention; 40 needs --timeout 300 in the unit.
+# Default stays 35 = safe under the stock unit. Set CHAKRA_MAX_BATCH=40
+# together with --timeout 300 to raise it (see README).
+MAX_BATCH = int(os.environ.get('CHAKRA_MAX_BATCH', '35'))
 
 def _auth_ok():
     return (not TOKEN) or (request.headers.get('X-Auth-Token') == TOKEN)
@@ -48,7 +54,10 @@ def _chat_key(chat):
     return re.sub(r'[^0-9\-]', '', str(chat))
 
 def _render_response(in_path, name, date=''):
-    td = tempfile.mkdtemp()
+    # under RENDER_DIR so _sweep() reclaims it if a worker dies mid-render
+    # (e.g. gunicorn timeout) and call_on_close never runs — a killed batch
+    # would otherwise strand up to ~90 MB of PDFs in /tmp forever
+    td = tempfile.mkdtemp(dir=RENDER_DIR)
     try:
         datas = svc.score_workbook_all(in_path)
         if len(datas) > MAX_BATCH:
@@ -63,7 +72,14 @@ def _render_response(in_path, name, date=''):
         raise
     if len(reports) == 1:
         out_path, person, data = reports[0]
-        resp = send_file(out_path, mimetype='application/pdf',
+        fh = open(out_path, 'rb')
+        # delete the tree NOW: the open fd keeps the bytes streamable (POSIX)
+        # and is closed by the WSGI file wrapper when the response ends.
+        # (response.call_on_close never fires for send_file responses — the
+        # WSGI iterable is the bare file wrapper, not the Response — so a
+        # delete-on-close callback silently leaks the dir instead.)
+        shutil.rmtree(td, ignore_errors=True)
+        resp = send_file(fh, mimetype='application/pdf',
                          as_attachment=True,
                          download_name=svc.safe_pdf_name(person))
         resp.headers['X-Overall'] = str(data['overall_score'])
@@ -74,13 +90,12 @@ def _render_response(in_path, name, date=''):
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
             for pdf_path, _person, _data in reports:
                 z.write(pdf_path, arcname=os.path.basename(pdf_path))
-        resp = send_file(zip_path, mimetype='application/zip',
+        fh = open(zip_path, 'rb')
+        shutil.rmtree(td, ignore_errors=True)
+        resp = send_file(fh, mimetype='application/zip',
                          as_attachment=True,
                          download_name=f'chakra-reports-{len(reports)}.zip')
     resp.headers['X-Count'] = str(len(reports))
-    # remove the rendered files once the response has been streamed (matters
-    # when many files are processed back-to-back — otherwise temp dirs pile up)
-    resp.call_on_close(lambda: shutil.rmtree(td, ignore_errors=True))
     return resp
 
 def _sweep():
@@ -90,6 +105,15 @@ def _sweep():
         try:
             if now - os.path.getmtime(p) > UPLOAD_TTL:
                 os.remove(p)
+        except OSError:
+            pass
+    # orphaned render dirs (worker killed mid-render); live renders are far
+    # younger than the TTL, so this only ever touches leftovers
+    for f in os.listdir(RENDER_DIR):
+        p = os.path.join(RENDER_DIR, f)
+        try:
+            if now - os.path.getmtime(p) > UPLOAD_TTL:
+                shutil.rmtree(p, ignore_errors=True)
         except OSError:
             pass
 
@@ -111,6 +135,7 @@ def report():
     if head[:2] != b'PK':
         return jsonify(ok=False, error='invalid xlsx file'), 400
     name = request.form.get('name', '')
+    _sweep()
     with tempfile.TemporaryDirectory() as td:
         in_path = os.path.join(td, 'in.xlsx')
         f.save(in_path)
