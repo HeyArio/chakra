@@ -951,12 +951,16 @@ html,body{{font-family:'Vazir',sans-serif;color:#F4EEFA;background:#0f0b18;-webk
 
 # ===== renderer =====
 def _render_pages(browser, jobs) -> None:
-    pg = browser.new_page()
+    # one fresh page per report: reusing a page accumulates ~35 MB per
+    # set_content (session history pins every rendered document), which walks
+    # a 21-report batch up to ~900 MB and would OOM the 2 GB VPS on a bigger
+    # one. A page open/close costs ~0.1 s — memory stays flat instead.
     for html_str, pdf_path in jobs:
+        pg = browser.new_page()
         pg.set_content(html_str, wait_until='networkidle')
         pg.pdf(path=pdf_path, format='A4', print_background=True,
                margin={'top':'0','bottom':'0','left':'0','right':'0'})
-    pg.close()
+        pg.close()
 
 def render_html_to_pdf(html_str: str, pdf_path: str) -> None:
     with sync_playwright() as p:

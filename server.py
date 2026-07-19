@@ -18,7 +18,8 @@ named after the people; n8n forwards it to Telegram like any document.
 
 Pending uploads live in a temp dir, one slot per chat, auto-expire after TTL.
 """
-import os, tempfile, shutil, json, re, time, logging, zipfile
+import os, tempfile, shutil, json, re, time, logging, zipfile, fcntl
+from contextlib import contextmanager
 from flask import Flask, request, send_file, jsonify
 
 import nazarban_service as svc
@@ -37,14 +38,30 @@ os.makedirs(STORE_DIR, exist_ok=True)
 os.makedirs(RENDER_DIR, exist_ok=True)
 UPLOAD_TTL = 1800  # 30 min
 # Largest batch rendered in one request. Two ceilings, measured:
-#   * Telegram: a bot can send at most 50 MB, and each PDF is ~1.26 MB raw /
-#     ~1.0 MB zipped -> ~48 people is the hard wall, 40 keeps 20% headroom.
-#   * gunicorn --timeout: a batch renders at ~1.4 s/PDF on the VPS, ~2.8 s
-#     if both workers render batches at once. --timeout 120 therefore only
-#     covers ~35 under contention; 40 needs --timeout 300 in the unit.
-# Default stays 35 = safe under the stock unit. Set CHAKRA_MAX_BATCH=40
-# together with --timeout 300 to raise it (see README).
+#   * Telegram (hard wall): a bot can send at most 50 MB and each PDF zips
+#     to ~1.0 MB -> ~48 people can never fit; 40 keeps ~20% headroom.
+#   * gunicorn --timeout: rendering is ~1-2 s/PDF on the 1-vCPU VPS and the
+#     render lock makes queued batches wait their turn, so a worker's whole
+#     request (wait + render) must fit the timeout. The stock 120 covers one
+#     ~35 batch at a time; 40 — and batches arriving together — need
+#     --timeout 300 in the unit.
+# RAM is NOT a ceiling anymore: chromium stays flat (~240 MB) regardless of
+# batch size, and the lock keeps it to one chromium total.
+# Default 35 = safe under the stock unit. Set CHAKRA_MAX_BATCH=40 together
+# with --timeout 300 to raise it (see README).
 MAX_BATCH = int(os.environ.get('CHAKRA_MAX_BATCH', '35'))
+
+# One Chromium at a time, across ALL gunicorn workers. The VPS has 1 vCPU
+# and 2 GB RAM: two concurrent renders don't finish any sooner (they share
+# the core) but they double peak memory into OOM territory. flock releases
+# by itself if a worker dies, so a killed render can't wedge the queue.
+_RENDER_LOCK = os.path.join(tempfile.gettempdir(), 'chakra_render.lock')
+
+@contextmanager
+def _render_slot():
+    with open(_RENDER_LOCK, 'w') as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        yield
 
 def _auth_ok():
     return (not TOKEN) or (request.headers.get('X-Auth-Token') == TOKEN)
@@ -65,8 +82,9 @@ def _render_response(in_path, name, date=''):
                              f'limit of {MAX_BATCH}; split the export')
         # The survey carries each respondent's name, so an explicitly-typed
         # name is optional; it overrides only a single-person file.
-        reports = svc.render_reports(datas, td, name_override=name,
-                                     date_str=date)
+        with _render_slot():
+            reports = svc.render_reports(datas, td, name_override=name,
+                                         date_str=date)
     except Exception:
         shutil.rmtree(td, ignore_errors=True)
         raise
