@@ -215,7 +215,7 @@
       "parameters": {
         "operation": "deleteMessage",
         "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
-        "messageId": "={{ $('Send Working Note').item.json.result?.message_id || $('Send Working Note').item.json.message_id }}"
+        "messageId": "={{ $('Send Working Note').first().json.result?.message_id || $('Send Working Note').first().json.message_id }}"
       },
       "id": "d4f9f3c5-0a64-4b81-8ea1-5c7d0d9a2f34",
       "name": "Delete Working Note",
@@ -231,7 +231,7 @@
           "name": "Chakra bot"
         }
       },
-      "notes": "Removes the '⏳ working…' note once the report or the error message has been delivered, so the chat stays clean. The message_id expression covers both output shapes of the Telegram node."
+      "notes": "Removes the '⏳ working…' note once the report or the error message has been delivered, so the chat stays clean. Uses .first() (not .item): the note lives on a parallel branch, so paired-item tracing can't reach it — .first() reads the node's output directly. The || covers both output shapes of the Telegram node."
     }
   ],
   "pinData": {},
