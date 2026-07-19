@@ -37,19 +37,18 @@ RENDER_DIR = os.path.join(tempfile.gettempdir(), 'chakra_render')
 os.makedirs(STORE_DIR, exist_ok=True)
 os.makedirs(RENDER_DIR, exist_ok=True)
 UPLOAD_TTL = 1800  # 30 min
-# Largest batch rendered in one request. Two ceilings, measured:
+# Largest batch rendered in one request — fixed at 30, and the bot's
+# "working…" note QUOTES this number to the owner, so change them together
+# (n8n workflow + here). Why 30 is comfortable everywhere, measured:
 #   * Telegram (hard wall): a bot can send at most 50 MB and each PDF zips
-#     to ~1.0 MB -> ~48 people can never fit; 40 keeps ~20% headroom.
-#   * gunicorn --timeout: rendering is ~1-2 s/PDF on the 1-vCPU VPS and the
-#     render lock makes queued batches wait their turn, so a worker's whole
-#     request (wait + render) must fit the timeout. The stock 120 covers one
-#     ~35 batch at a time; 40 — and batches arriving together — need
-#     --timeout 300 in the unit.
-# RAM is NOT a ceiling anymore: chromium stays flat (~240 MB) regardless of
-# batch size, and the lock keeps it to one chromium total.
-# Default 35 = safe under the stock unit. Set CHAKRA_MAX_BATCH=40 together
-# with --timeout 300 to raise it (see README).
-MAX_BATCH = int(os.environ.get('CHAKRA_MAX_BATCH', '35'))
+#     to ~1.0 MB -> ~48 people can never fit; 30 uses ~60% of the wall.
+#   * gunicorn --timeout 300: rendering is ~1-2 s/PDF on the 1-vCPU VPS and
+#     the render lock queues concurrent batches, so a worker's whole request
+#     (wait + render) must fit the timeout: three stacked 30-batches ≈ 180 s.
+#   * RAM is no ceiling: chromium stays flat (~240 MB) at any batch size,
+#     and the lock keeps it to one chromium total.
+# CHAKRA_MAX_BATCH overrides for special cases; never set above 45.
+MAX_BATCH = int(os.environ.get('CHAKRA_MAX_BATCH', '30'))
 
 # One Chromium at a time, across ALL gunicorn workers. The VPS has 1 vCPU
 # and 2 GB RAM: two concurrent renders don't finish any sooner (they share
@@ -78,8 +77,11 @@ def _render_response(in_path, name, date=''):
     try:
         datas = svc.score_workbook_all(in_path)
         if len(datas) > MAX_BATCH:
-            raise ValueError(f'batch of {len(datas)} respondents exceeds the '
-                             f'limit of {MAX_BATCH}; split the export')
+            # bilingual: the bot relays this text straight into the chat
+            raise ValueError(
+                f'این فایل {len(datas)} نفر دارد؛ حداکثر {MAX_BATCH} نفر در '
+                f'هر فایل — لطفاً فایل را تقسیم کنید. '
+                f'(batch of {len(datas)} exceeds the limit of {MAX_BATCH})')
         # The survey carries each respondent's name, so an explicitly-typed
         # name is optional; it overrides only a single-person file.
         with _render_slot():

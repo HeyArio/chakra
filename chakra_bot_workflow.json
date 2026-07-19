@@ -63,6 +63,29 @@
     },
     {
       "parameters": {
+        "operation": "sendMessage",
+        "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
+        "text": "⏳ دریافت شد — در حال ساخت گزارش…\nحداکثر ۳۰ نفر در هر فایل اکسل؛ ساخت گزارش گروهی حدود یک دقیقه زمان می‌برد.",
+        "additionalFields": {}
+      },
+      "id": "a1f6f0d2-7c31-4e5e-9b7e-2f4f7a6f9c01",
+      "name": "Send Working Note",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        16,
+        16
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "cWt2loWBfcYWXkku",
+          "name": "Chakra bot"
+        }
+      },
+      "notes": "Instant '⏳ working…' note, states the 30-people-per-file limit. Runs on a PARALLEL branch: a Telegram node placed inline before the HTTP request would strip the xlsx binary off the item. Deleted again by 'Delete Working Note' once the report (or an error) has been sent."
+    },
+    {
+      "parameters": {
         "method": "POST",
         "url": "http://185.221.237.90:8099/report",
         "sendHeaders": true,
@@ -90,7 +113,8 @@
             "response": {
               "responseFormat": "file"
             }
-          }
+          },
+          "timeout": 300000
         }
       },
       "id": "4634e97e-976f-4c62-beac-a36550e18d0a",
@@ -99,9 +123,44 @@
       "typeVersion": 4.2,
       "position": [
         16,
-        144
+        272
       ],
-      "notes": "One-shot: sends the .xlsx, VPS reads the name from the file (column BU), scores it and returns the PDF as binary 'data'. Stateless -> safe to run many in parallel. Set X-Auth-Token to your VPS token. No 'name' field needed (pass one only to override)."
+      "onError": "continueRegularOutput",
+      "notes": "One-shot: sends the .xlsx, VPS reads the name(s) from the file, scores and returns the PDF — or a ZIP for a batch file — as binary 'data'. Stateless -> safe to run many in parallel (the VPS serializes renders itself). Set X-Auth-Token to your VPS token. onError continues so failures reach the chat instead of dying silently; timeout 300 s matches the VPS render budget."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-binary",
+              "leftValue": "={{ $binary.data }}",
+              "rightValue": "",
+              "operator": {
+                "type": "object",
+                "operation": "exists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b2e7c1a3-8d42-4f6f-8c8f-3a5b8b7e0d12",
+      "name": "Render OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        256,
+        272
+      ],
+      "notes": "TRUE = the VPS returned a file (binary 'data' present) -> send it. FALSE = any failure (over-the-cap batch, VPS down, timeout) -> tell the owner instead of failing silently."
     },
     {
       "parameters": {
@@ -117,7 +176,7 @@
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.2,
       "position": [
-        256,
+        496,
         144
       ],
       "webhookId": "5aea1501-058c-4ba4-8992-62bb13f0b313",
@@ -127,7 +186,52 @@
           "name": "Chakra bot"
         }
       },
-      "notes": "Sends the finished PDF back. Filename (<name>.pdf) comes from the VPS Content-Disposition header."
+      "notes": "Sends the finished PDF (or chakra-reports-N.zip for a batch) back. Filename comes from the VPS Content-Disposition header."
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
+        "text": "={{ '❌ ساخت گزارش ناموفق بود.' + '\\n' + ($json.error?.description || $json.error?.message || 'فایل را بررسی کنید — حداکثر ۳۰ نفر در هر فایل اکسل.') }}",
+        "additionalFields": {}
+      },
+      "id": "c3d8e2b4-9e53-4a70-9d90-4b6c9c8f1e23",
+      "name": "Send Error",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        496,
+        400
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "cWt2loWBfcYWXkku",
+          "name": "Chakra bot"
+        }
+      },
+      "notes": "Relays the VPS error (e.g. 'batch of 52 exceeds the limit of 30') into the chat. Before this branch existed, a failed render produced nothing at all."
+    },
+    {
+      "parameters": {
+        "operation": "deleteMessage",
+        "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
+        "messageId": "={{ $('Send Working Note').item.json.result?.message_id || $('Send Working Note').item.json.message_id }}"
+      },
+      "id": "d4f9f3c5-0a64-4b81-8ea1-5c7d0d9a2f34",
+      "name": "Delete Working Note",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        736,
+        272
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "cWt2loWBfcYWXkku",
+          "name": "Chakra bot"
+        }
+      },
+      "notes": "Removes the '⏳ working…' note once the report or the error message has been delivered, so the chat stays clean. The message_id expression covers both output shapes of the Telegram node."
     }
   ],
   "pinData": {},
@@ -147,6 +251,11 @@
       "main": [
         [
           {
+            "node": "Send Working Note",
+            "type": "main",
+            "index": 0
+          },
+          {
             "node": "Render PDF (VPS)",
             "type": "main",
             "index": 0
@@ -159,7 +268,47 @@
       "main": [
         [
           {
+            "node": "Render OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render OK?": {
+      "main": [
+        [
+          {
             "node": "Send PDF Report",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send PDF Report": {
+      "main": [
+        [
+          {
+            "node": "Delete Working Note",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Error": {
+      "main": [
+        [
+          {
+            "node": "Delete Working Note",
             "type": "main",
             "index": 0
           }

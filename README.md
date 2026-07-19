@@ -164,11 +164,12 @@ headers `X-Overall`, `X-Dominant`, `X-Archetype`.
 **Batch file (2+ rows)** → `chakra-reports-<N>.zip` (`application/zip`) holding one
 `<person>.pdf` per row (duplicate names deduped `_2`, `_3`…). Both shapes carry `X-Count`.
 
-Batches above the cap — `CHAKRA_MAX_BATCH`, **default 35** — are rejected with a clear
-error; split the export in Porsline. The cap can go up to **40** by setting the env var in
-the systemd unit *together with* `--timeout 300` (see below). **Never set it above 45:**
-each PDF zips to ~1.0 MB and Telegram bots cannot send more than 50 MB, so ~48 people is a
-hard wall no server setting can move.
+Batches above the cap — `CHAKRA_MAX_BATCH`, **default 30** — are rejected with a bilingual
+error that the bot relays into the chat; split the export in Porsline. **30 is the number
+the bot's «⏳ working…» note quotes to the owner** — if you override the env var, update the
+note text in the n8n workflow too. **Never set it above 45:** each PDF zips to ~1.0 MB and
+Telegram bots cannot send more than 50 MB, so ~48 people is a hard wall no server setting
+can move.
 
 Renders take a **global lock** (one Chromium at a time across both workers): on a 1-vCPU
 box concurrent renders don't finish any sooner, but they double peak RAM. Batches that
@@ -211,24 +212,21 @@ The unit sets `NAZARBAN_TOKEN` and runs:
 
 Measured: rendering is ~1.1 s/PDF on a 4-core dev box — budget **~2 s/PDF** on the VPS's
 single KVM core. Chromium memory stays flat (~240 MB) for any batch size, and the render
-lock keeps it to one Chromium total, so **RAM no longer limits batch size**. What limits it:
+lock keeps it to one Chromium total, so **RAM no longer limits batch size**. The cap is
+**fixed at 30** (the number the bot quotes to the owner); with `--timeout 300` even three
+30-person batches stacked behind the lock (~180 s for the last one) finish safely, and a
+30-report ZIP (~30 MB) sits at 60% of Telegram's 50 MB bot limit. Headroom on every axis.
 
-| Config | Safe at a time | Why |
-|--------|----------------|-----|
-| Stock unit (`--timeout 120`, cap 35) | one batch ≤ 35 (~70 s); stacked 21-person batches also fit | a 2nd big batch queued behind the lock can exceed 120 s and get killed |
-| **Recommended:** `--timeout 300` + `CHAKRA_MAX_BATCH=40` | 40 per file, two max-size batches stacked | queue wait + render ≈ 200 s fits 300 s |
-| Above 45 | never | ZIP crosses Telegram's 50 MB bot limit (~48 = hard wall) |
-
-To adopt the recommended config, edit `/etc/systemd/system/chakra.service`:
+The recommended unit (`/etc/systemd/system/chakra.service`):
 
 ```ini
-Environment=CHAKRA_MAX_BATCH=40
 ExecStart=/usr/local/bin/gunicorn -w 2 -b 0.0.0.0:8099 --timeout 300 server:app
 ```
 
-then `systemctl daemon-reload && systemctl restart chakra`. If three max-size batches are
-dumped at once, the third may time out waiting — resend it; nothing is corrupted.
-`/tmp` is tmpfs (RAM): a rendering batch holds ~90 MB there briefly; orphans are swept.
+then `systemctl daemon-reload && systemctl restart chakra`. No `CHAKRA_MAX_BATCH` line is
+needed for the standard 30 — the env var exists only to override it (up to 45 absolute max:
+~48 people is where the ZIP crosses Telegram's 50 MB wall; also update the bot's note text).
+`/tmp` is tmpfs (RAM): a rendering batch holds ~65 MB there briefly; orphans are swept.
 
 > **Always use gunicorn, not `python3 server.py`.** The Flask dev server is single-threaded
 > and hangs when Chromium launches inside a request. gunicorn's worker processes fix this.
@@ -242,33 +240,45 @@ dumped at once, the third may time out waiting — resend it; nothing is corrupt
 
 ## The n8n workflow
 
-Import `chakra_bot_workflow.json` into n8n Cloud. Since the name no longer has to be typed, the
-flow is four nodes in a straight line — no prompt, no second round-trip, and **safe to run many
-at once**:
+Import `chakra_bot_workflow.json` into n8n Cloud. Eight nodes, still no Code nodes and no
+state — and **safe to run many at once**:
 
 1. **Telegram Trigger** — Download Files ON. Each uploaded file is its own message.
-2. **Is it a file?** (IF) — TRUE = a document → render it. FALSE = plain text → ignored.
-3. **Render PDF (VPS)** (HTTP) — POST `/report` with the xlsx binary. The VPS reads the
+2. **Is it a file?** (IF) — TRUE = a document → process it. FALSE = plain text → ignored.
+3. **Send Working Note** (Telegram) — instantly posts «⏳ در حال ساخت گزارش…» and states the
+   **30-people-per-file limit**. Sits on a **parallel branch**: a Telegram node placed inline
+   before the HTTP request would strip the xlsx binary off the item.
+4. **Render PDF (VPS)** (HTTP) — POST `/report` with the xlsx binary. The VPS reads the
    name(s) from the file, scores and returns the PDF — or a ZIP of PDFs when the file holds a
-   whole batch. **Stateless** — no `chat`/`name` passed, so concurrent calls never collide.
-4. **Send PDF Report** (Telegram) — sends the returned document (`<name>.pdf` or
-   `chakra-reports-N.zip`) back into the chat. The node forwards whatever binary it gets, so
-   **batch support needed no workflow change**.
+   whole batch. **Stateless** — no `chat`/`name` passed, so concurrent calls never collide
+   (the VPS serializes renders itself). *On error the flow continues* into…
+5. **Render OK?** (IF) — did binary `data` come back? TRUE → send it. FALSE → report the
+   failure.
+6. **Send PDF Report** (Telegram) — sends the returned document (`<name>.pdf` or
+   `chakra-reports-N.zip`) back into the chat.
+7. **Send Error** (Telegram) — relays the VPS error into the chat (e.g. the bilingual
+   "batch of 52 exceeds the limit of 30 — split the export"). Before this branch existed a
+   failed render was **silent** — the owner just never got a file.
+8. **Delete Working Note** (Telegram) — removes the ⏳ note once the report (or the error)
+   has been delivered, so the chat stays clean.
 
 ### Config after import
-- Attach the Telegram bot credential (BotFather token) to the 2 Telegram nodes.
+- Attach the Telegram bot credential (BotFather token) to the **4 Telegram nodes**
+  (Working Note, PDF Report, Error, Delete Note) + the Trigger.
 - Set `X-Auth-Token` = your `NAZARBAN_TOKEN` in the HTTP node.
 - URL is pre-filled with the VPS IP (`185.221.237.90:8099`).
-- Activate.
+- Activate, then smoke-test all three paths: a normal file (⏳ appears → PDF arrives → ⏳
+  vanishes), a batch file, and an over-30-row file (⏳ → ❌ error message → ⏳ vanishes).
 
 ### Many people at once (batches)
 Two ways, both supported:
 
 **One batch file** (how the client sends them now): the Porsline "download all results"
 export with one row per person. `/report` scores every row, renders every PDF in a single
-Chromium session and returns one ZIP; the bot posts it as one document. Capped at
-`CHAKRA_MAX_BATCH` (default 35, max sensible 40 — see "Batch capacity" above); split a
-bigger export in Porsline.
+Chromium session and returns one ZIP; the bot posts it as one document. Capped at **30
+people per file** (`CHAKRA_MAX_BATCH` — see "Batch capacity" above); the bot's working
+note states this limit, and an over-the-cap file gets a bilingual "split the export"
+message in the chat.
 
 **Many single files:** Telegram delivers each file as a separate message, so 50 files = 50
 independent executions, each its own `/report` call. Because `/report` is stateless (nothing
