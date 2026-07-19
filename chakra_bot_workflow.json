@@ -186,7 +186,7 @@
           "name": "Chakra bot"
         }
       },
-      "notes": "Sends the finished PDF (or chakra-reports-N.zip for a batch) back. Filename comes from the VPS Content-Disposition header."
+      "notes": "Sends the finished PDF (or a گزارش-انرژی-N-نفر.zip for a batch) back. Filename comes from the VPS Content-Disposition header."
     },
     {
       "parameters": {

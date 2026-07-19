@@ -69,6 +69,8 @@ def _chat_key(chat):
     # only allow digits / minus (telegram chat ids) to build a safe filename
     return re.sub(r'[^0-9\-]', '', str(chat))
 
+_FA_DIGITS = str.maketrans('0123456789', '۰۱۲۳۴۵۶۷۸۹')
+
 def _render_response(in_path, name, date=''):
     # under RENDER_DIR so _sweep() reclaims it if a worker dies mid-render
     # (e.g. gunicorn timeout) and call_on_close never runs — a killed batch
@@ -112,9 +114,10 @@ def _render_response(in_path, name, date=''):
                 z.write(pdf_path, arcname=os.path.basename(pdf_path))
         fh = open(zip_path, 'rb')
         shutil.rmtree(td, ignore_errors=True)
+        fa_count = str(len(reports)).translate(_FA_DIGITS)
         resp = send_file(fh, mimetype='application/zip',
                          as_attachment=True,
-                         download_name=f'chakra-reports-{len(reports)}.zip')
+                         download_name=f'گزارش-انرژی-{fa_count}-نفر.zip')
     resp.headers['X-Count'] = str(len(reports))
     return resp
 

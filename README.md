@@ -28,7 +28,7 @@ Owner (Telegram)
    ▼
 n8n (cloud)  ──2. POST /report (file)──►  VPS service
    │                                        reads names from file → scores → renders PDFs → returns
-   │  3. bot sends <name>.pdf (or chakra-reports-N.zip) back into the chat
+   │  3. bot sends <name>.pdf (or گزارش-انرژی-N-نفر.zip) back into the chat
    ▼
 Owner receives the report(s)
 ```
@@ -161,7 +161,7 @@ the systemd env). Returns 401 if it doesn't match.
 
 **Single respondent** → the PDF (`application/pdf`) named after the person, with summary
 headers `X-Overall`, `X-Dominant`, `X-Archetype`.
-**Batch file (2+ rows)** → `chakra-reports-<N>.zip` (`application/zip`) holding one
+**Batch file (2+ rows)** → `گزارش-انرژی-<N>-نفر.zip` (`application/zip`, Persian-digit count) holding one
 `<person>.pdf` per row (duplicate names deduped `_2`, `_3`…). Both shapes carry `X-Count`.
 
 Batches above the cap — `CHAKRA_MAX_BATCH`, **default 30** — are rejected with a bilingual
@@ -255,7 +255,7 @@ state — and **safe to run many at once**:
 5. **Render OK?** (IF) — did binary `data` come back? TRUE → send it. FALSE → report the
    failure.
 6. **Send PDF Report** (Telegram) — sends the returned document (`<name>.pdf` or
-   `chakra-reports-N.zip`) back into the chat.
+   `گزارش-انرژی-N-نفر.zip`) back into the chat.
 7. **Send Error** (Telegram) — relays the VPS error into the chat (e.g. the bilingual
    "batch of 52 exceeds the limit of 30 — split the export"). Before this branch existed a
    failed render was **silent** — the owner just never got a file.
