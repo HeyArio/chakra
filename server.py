@@ -7,13 +7,18 @@ The VPS remembers the last uploaded file per Telegram chat.
 
 Endpoints:
   GET  /health
-  POST /report   file=<xlsx>, name=<str>            -> PDF   (one-shot, optional)
+  POST /report   file=<xlsx>, name=<str>            -> PDF or ZIP (one-shot)
   POST /upload   file=<xlsx>, chat=<chat_id>         -> {ok}  (stash by chat)
-  POST /render   chat=<chat_id>, name=<str>          -> PDF   (render stashed file)
+  POST /render   chat=<chat_id>, name=<str>          -> PDF or ZIP (stashed file)
+
+A Porsline export may carry one respondent (the old per-person file) or a
+whole batch, one row each. One respondent -> a PDF, exactly as before.
+Several -> every report is rendered and returned as a single ZIP of PDFs
+named after the people; n8n forwards it to Telegram like any document.
 
 Pending uploads live in a temp dir, one slot per chat, auto-expire after TTL.
 """
-import os, tempfile, shutil, json, re, time, logging
+import os, tempfile, shutil, json, re, time, logging, zipfile
 from flask import Flask, request, send_file, jsonify
 
 import nazarban_service as svc
@@ -29,14 +34,14 @@ log = logging.getLogger('chakra')
 STORE_DIR = os.path.join(tempfile.gettempdir(), 'chakra_uploads')
 os.makedirs(STORE_DIR, exist_ok=True)
 UPLOAD_TTL = 1800  # 30 min
+# Largest batch rendered in one request. Rendering is ~1s per PDF, but the
+# binding limit is Telegram: each PDF is ~1.3 MB (embedded fonts), and a bot
+# can send at most 50 MB — 35 keeps the ZIP safely under that. A bigger
+# export should be split in Porsline before uploading.
+MAX_BATCH = 35
 
 def _auth_ok():
     return (not TOKEN) or (request.headers.get('X-Auth-Token') == TOKEN)
-
-def _safe_name(name):
-    safe = re.sub(r'[^\w\u0600-\u06FF\- ]', '', name).strip() if name else ''
-    safe = re.sub(r'\s+', '_', safe)
-    return f"{safe}.pdf" if safe else "chakra-report.pdf"
 
 def _chat_key(chat):
     # only allow digits / minus (telegram chat ids) to build a safe filename
@@ -44,21 +49,37 @@ def _chat_key(chat):
 
 def _render_response(in_path, name, date=''):
     td = tempfile.mkdtemp()
-    out_path = os.path.join(td, 'out.pdf')
-    data = svc.score_workbook(in_path)
-    # The Porsline survey carries the respondent's name (column BU), so an
-    # explicitly-typed name is optional now: fall back to the one in the file.
-    person = (name or '').strip() or data.get('person_name', '')
-    fonts = svc._load_fonts()
-    html_str = svc.build_html(data, fonts, person_name=person, date_str=date)
-    svc.render_html_to_pdf(html_str, out_path)
-    resp = send_file(out_path, mimetype='application/pdf',
-                     as_attachment=True, download_name=_safe_name(person))
-    resp.headers['X-Overall'] = str(data['overall_score'])
-    resp.headers['X-Dominant'] = data['dominant']
-    resp.headers['X-Archetype'] = data['archetype']
-    # remove the rendered PDF once the response has been streamed (matters when
-    # many files are processed back-to-back — otherwise temp dirs pile up)
+    try:
+        datas = svc.score_workbook_all(in_path)
+        if len(datas) > MAX_BATCH:
+            raise ValueError(f'batch of {len(datas)} respondents exceeds the '
+                             f'limit of {MAX_BATCH}; split the export')
+        # The survey carries each respondent's name, so an explicitly-typed
+        # name is optional; it overrides only a single-person file.
+        reports = svc.render_reports(datas, td, name_override=name,
+                                     date_str=date)
+    except Exception:
+        shutil.rmtree(td, ignore_errors=True)
+        raise
+    if len(reports) == 1:
+        out_path, person, data = reports[0]
+        resp = send_file(out_path, mimetype='application/pdf',
+                         as_attachment=True,
+                         download_name=svc.safe_pdf_name(person))
+        resp.headers['X-Overall'] = str(data['overall_score'])
+        resp.headers['X-Dominant'] = data['dominant']
+        resp.headers['X-Archetype'] = data['archetype']
+    else:
+        zip_path = os.path.join(td, 'reports.zip')
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+            for pdf_path, _person, _data in reports:
+                z.write(pdf_path, arcname=os.path.basename(pdf_path))
+        resp = send_file(zip_path, mimetype='application/zip',
+                         as_attachment=True,
+                         download_name=f'chakra-reports-{len(reports)}.zip')
+    resp.headers['X-Count'] = str(len(reports))
+    # remove the rendered files once the response has been streamed (matters
+    # when many files are processed back-to-back — otherwise temp dirs pile up)
     resp.call_on_close(lambda: shutil.rmtree(td, ignore_errors=True))
     return resp
 

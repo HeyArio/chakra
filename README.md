@@ -7,9 +7,13 @@ straight out of the survey, so nobody has to type it. The report is 2 analysis p
 personalized **4-week energy growth & balance program** (one chakra per week).
 
 The survey is a **Porsline** export (`Results` sheet) that contains only the answers, the
-person's name and the dates. The scoring model (questions, options, 1–4 scores, reverse
-flags, per-metric weights) lives in the bundled `scoring_model.xlsx`; the service maps each
-text answer back onto it to compute the scores.
+person's name, phone and the dates. The scoring model (questions, options, 1–4 scores,
+reverse flags, per-metric weights) lives in the bundled `scoring_model.xlsx`; the service
+maps each text answer back onto it to compute the scores.
+
+The export may hold **one respondent or a whole batch** (one row each — Porsline's
+"download all results" file). One person → one PDF, as always. Several → the bot answers
+with a single **ZIP** containing every report, each PDF named after its person.
 
 Built for **Nazarban Studio** / nazarbanai.com. Persian-first (RTL, Vazirmatn), dark
 editorial report design.
@@ -20,21 +24,23 @@ editorial report design.
 
 ```
 Owner (Telegram)
-   │  1. sends the Porsline survey .xlsx (one file, or 50)
+   │  1. sends the Porsline survey .xlsx (one person — or a batch export)
    ▼
 n8n (cloud)  ──2. POST /report (file)──►  VPS service
-   │                                        reads name from file → scores → renders PDF → returns it
-   │  3. bot sends <name>.pdf back into the chat
+   │                                        reads names from file → scores → renders PDFs → returns
+   │  3. bot sends <name>.pdf (or chakra-reports-N.zip) back into the chat
    ▼
-Owner receives the report
+Owner receives the report(s)
 ```
 
 - **Only the owner uses the bot.** It's single-user by design.
-- **No "who is this for?" step** — the respondent's name is a field in the survey (column `BU`),
-  so the service reads it from the uploaded file and uses it as both the in-report name and the
-  PDF filename. (An explicit `name` can still be POSTed to override it.)
+- **No "who is this for?" step** — each respondent's name is a field in the survey
+  («نام و نام خانوادگی»), so the service reads it from the uploaded file and uses it as both
+  the in-report name and the PDF filename. (An explicit `name` can still be POSTed to
+  override it — single-person files only; a batch always names from the file.)
 - **One stateless call per file** (`/report`). Nothing is keyed by chat, so a burst of files
-  can't overwrite each other — send 50 and they all come back. n8n holds no state, no Code nodes.
+  can't overwrite each other — send 50 files, or one batch file with 21 rows; every report
+  comes back. n8n holds no state, no Code nodes.
 
 ---
 
@@ -79,13 +85,20 @@ workflow JSON to import lives here.
 The system uses **two** workbooks with a clean split of responsibility.
 
 ### 1. The uploaded survey — a Porsline export (`Results` sheet)
-One sheet, one row per respondent. Columns:
+One sheet, **one row per respondent** — a single row (the old per-person export) or many
+(the batch export); blank padding rows are ignored. Columns:
 - `A` response link · `B` respondent id
 - `C … BT` — the **70 questions**, each cell holding the chosen answer as **text** (not a number)
-- `BU` — «نام و نام خانوادگی …» → the respondent's **name** (drives the report + filename)
-- `BV` / `BW` — start / finish timestamps (Jalali); the **finish** time (`BW`) is stamped on the report as its date (falls back to `BV`, then today)
+- «نام و نام خانوادگی …» → the respondent's **name** (drives the report + filename)
+- «شماره موبایل» → phone (batch exports only; carried through, not printed on the report)
+- «تاریخ شروع» / «تاریخ اتمام» — start / finish timestamps (Jalali); the **finish** time is
+  stamped on the report as its date (falls back to start, then today)
 
-This file carries **no scoring information** — just the answers, the name and the dates.
+The special columns are located by **header text, not column letter** — Porsline shifts
+letters when the survey gains a field (the batch export's phone column moved the dates from
+`BV`/`BW` to `BW`/`BX`), and header matching absorbs that.
+
+This file carries **no scoring information** — just the answers, the names and the dates.
 
 ### 2. `scoring_model.xlsx` — the scoring brain (bundled, not uploaded)
 The client's master workbook. Sheet `Questions` has 70 rows; each row: category, main chakra,
@@ -143,15 +156,23 @@ the systemd env). Returns 401 if it doesn't match.
 |--------|------|------|---------|
 | GET | `/health` | — | `{"ok":true,"service":"chakra-report"}` |
 | POST | `/upload` | multipart: `file` (xlsx), `chat` (chat id) | `{"ok":true,"chat":"..."}` — stashes the file keyed by chat |
-| POST | `/render` | form or JSON: `chat` (chat id); `name` **optional** | the PDF (`application/pdf`), one-time use — deletes the stash |
-| POST | `/report` | multipart: `file`; `name` **optional** | the PDF in one shot (no chat needed; kept for convenience) |
+| POST | `/render` | form or JSON: `chat` (chat id); `name` **optional** | PDF or ZIP (see below), one-time use — deletes the stash |
+| POST | `/report` | multipart: `file`; `name` **optional** | PDF or ZIP in one shot (no chat needed; kept for convenience) |
 
-> `name` is optional: when omitted (or blank) the service reads the respondent's name from the
-> survey (column `BU`) and uses it for both the in-report name and the PDF filename. Pass `name`
-> only to override.
+**Single respondent** → the PDF (`application/pdf`) named after the person, with summary
+headers `X-Overall`, `X-Dominant`, `X-Archetype`.
+**Batch file (2+ rows)** → `chakra-reports-<N>.zip` (`application/zip`) holding one
+`<person>.pdf` per row (duplicate names deduped `_2`, `_3`…). Both shapes carry `X-Count`.
+Batches above **35 respondents are rejected** with a clear error — each PDF is ~1.3 MB and
+Telegram bots can send at most 50 MB, so a bigger export must be split in Porsline first.
+
+> `name` is optional: when omitted (or blank) the service reads each respondent's name from
+> the survey («نام و نام خانوادگی») and uses it for both the in-report name and the PDF
+> filename. Pass `name` only to override — it applies to single-person files; a batch always
+> names from the file.
 
 Pending uploads live in `$TMPDIR/chakra_uploads/`, one slot per chat, auto-expire after
-30 min. Response headers `X-Overall`, `X-Dominant`, `X-Archetype` expose the summary.
+30 min.
 
 ---
 
@@ -178,6 +199,10 @@ curl -s http://localhost:8099/health    # confirm it answers
 The unit sets `NAZARBAN_TOKEN` and runs:
 `gunicorn -w 2 -b 0.0.0.0:8099 --timeout 120 server:app`
 
+> **Timeout budget:** a batch renders in one request at ~1 s per PDF after Chromium starts
+> (a 21-person file measures ~25 s end to end), so the 35-respondent cap fits `--timeout 120`
+> with plenty of headroom. If the cap is ever raised, raise the gunicorn timeout with it.
+
 > **Always use gunicorn, not `python3 server.py`.** The Flask dev server is single-threaded
 > and hangs when Chromium launches inside a request. gunicorn's worker processes fix this.
 
@@ -196,10 +221,12 @@ at once**:
 
 1. **Telegram Trigger** — Download Files ON. Each uploaded file is its own message.
 2. **Is it a file?** (IF) — TRUE = a document → render it. FALSE = plain text → ignored.
-3. **Render PDF (VPS)** (HTTP) — POST `/report` with the xlsx binary. The VPS reads the name
-   from the file (column `BU`), scores it and returns the PDF. **Stateless** — no `chat`/`name`
-   passed, so concurrent calls never collide.
-4. **Send PDF Report** (Telegram) — sends the `<name>.pdf` back into the chat.
+3. **Render PDF (VPS)** (HTTP) — POST `/report` with the xlsx binary. The VPS reads the
+   name(s) from the file, scores and returns the PDF — or a ZIP of PDFs when the file holds a
+   whole batch. **Stateless** — no `chat`/`name` passed, so concurrent calls never collide.
+4. **Send PDF Report** (Telegram) — sends the returned document (`<name>.pdf` or
+   `chakra-reports-N.zip`) back into the chat. The node forwards whatever binary it gets, so
+   **batch support needed no workflow change**.
 
 ### Config after import
 - Attach the Telegram bot credential (BotFather token) to the 2 Telegram nodes.
@@ -207,11 +234,18 @@ at once**:
 - URL is pre-filled with the VPS IP (`185.221.237.90:8099`).
 - Activate.
 
-### Many files at once (batches)
-Telegram delivers each file as a separate message, so 50 files = 50 independent executions, each
-its own `/report` call. Because `/report` is stateless (nothing is keyed by chat), they can't
-overwrite each other — unlike the old `/upload`+`/render` pair, which kept **one stashed file per
-chat** and would clobber itself under concurrency.
+### Many people at once (batches)
+Two ways, both supported:
+
+**One batch file** (how the client sends them now): the Porsline "download all results"
+export with one row per person. `/report` scores every row, renders every PDF in a single
+Chromium session and returns one ZIP; the bot posts it as one document. Capped at 35 rows
+per file (Telegram's 50 MB bot limit) — split a bigger export in Porsline.
+
+**Many single files:** Telegram delivers each file as a separate message, so 50 files = 50
+independent executions, each its own `/report` call. Because `/report` is stateless (nothing
+is keyed by chat), they can't overwrite each other — unlike the old `/upload`+`/render` pair,
+which kept **one stashed file per chat** and would clobber itself under concurrency.
 
 Throughput is bounded by PDF rendering on the VPS: **~2.4 s per file** (Chromium render; scoring
 itself is ~0.1 s). With the default `gunicorn -w 2`, two render in parallel, so ~50 files drain in
@@ -226,8 +260,8 @@ requests, so the VPS won't be stampeded.
   the `/upload`+`/render` stash. Nothing is keyed by chat, so nothing can be clobbered when files
   arrive together. (`/upload` + `/render` are still in the service for the old two-message
   pattern, but the bot no longer uses them.)
-- **No name prompt.** The respondent's name is a field inside the survey (column `BU`), so the
-  VPS reads it from the uploaded file. This removed the old "who is this for?" message, the
+- **No name prompt.** The respondent's name is a field inside the survey («نام و نام
+  خانوادگی», located by header text), so the VPS reads it from the uploaded file. This removed the old "who is this for?" message, the
   second Telegram execution, and the state-matching that went with it.
 - **Answers are matched by text.** Porsline exports the chosen answer as text, not a 1–4 index,
   so the service maps each answer back to its option in `scoring_model.xlsx`. Keep the option

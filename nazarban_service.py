@@ -177,48 +177,61 @@ def _load_scoring_model() -> list:
     _MODEL_CACHE = out
     return out
 
-# Porsline "Results" header keywords used to locate the special columns
+# Porsline "Results" header keywords used to locate the special columns.
+# Columns are found by header TEXT, never by letter: Porsline shifts columns
+# when the survey gains a field (the batch export added «شماره موبایل» before
+# the dates), and header matching absorbs that.
 _P_NAME_KEY = 'نام و نام خانوادگی'
+_P_PHONE_KEY = 'موبایل'
 _P_SKIP_HDRS = ('پاسخنامه', 'شناسه پاسخ دهنده')
 
-def read_porsline(path: str) -> dict:
-    """Read a Porsline survey export ("Results" sheet). Returns the person's
-    name + start/end dates and a {normalized-question -> answer-text} map.
-    One uploaded file = one respondent (first populated data row)."""
+def read_porsline_all(path: str) -> list:
+    """Read a Porsline survey export ("Results" sheet). Returns one dict per
+    respondent — name, phone, start/end dates and a {normalized-question ->
+    answer-text} map — in file order. A file may hold a single respondent
+    (the old per-person export) or a whole batch, one row each; blank rows
+    (Porsline pads the sheet with them) are skipped wherever they appear."""
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb['Results']
     header = [c.value for c in ws[1]]
-    data_row = None
-    for r in range(2, ws.max_row + 1):
-        if any(ws.cell(r, c).value not in (None, '') for c in range(1, ws.max_column + 1)):
-            data_row = r
-            break
-    if data_row is None:
+    out = []
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        if all(c.value in (None, '') for c in row):
+            continue
+        name = phone = start = end = None
+        answers = {}
+        for c, cell in enumerate(row, 1):
+            h = header[c - 1] if c <= len(header) else None
+            if h is None or str(h).strip() == '':
+                continue
+            hs = str(h)
+            val = cell.value
+            if _P_NAME_KEY in hs:
+                name = val
+            elif _P_PHONE_KEY in hs:
+                phone = val
+            elif 'تاریخ شروع' in hs:
+                start = val
+            elif 'تاریخ اتمام' in hs:
+                end = val
+            elif any(k in hs for k in _P_SKIP_HDRS):
+                continue
+            else:
+                answers[_norm_fa(hs)] = val
+        out.append({
+            'name': str(name).strip() if name not in (None, '') else '',
+            'phone': str(phone).strip() if phone not in (None, '') else '',
+            'start_date': str(start).strip() if start not in (None, '') else '',
+            'end_date': str(end).strip() if end not in (None, '') else '',
+            'answers': answers,
+        })
+    if not out:
         raise RuntimeError('Porsline export has no response row')
-    name = start = end = None
-    answers = {}
-    for c in range(1, ws.max_column + 1):
-        h = header[c - 1]
-        if h is None or str(h).strip() == '':
-            continue
-        hs = str(h)
-        val = ws.cell(data_row, c).value
-        if _P_NAME_KEY in hs:
-            name = val
-        elif 'تاریخ شروع' in hs:
-            start = val
-        elif 'تاریخ اتمام' in hs:
-            end = val
-        elif any(k in hs for k in _P_SKIP_HDRS):
-            continue
-        else:
-            answers[_norm_fa(hs)] = val
-    return {
-        'name': str(name).strip() if name not in (None, '') else '',
-        'start_date': str(start).strip() if start not in (None, '') else '',
-        'end_date': str(end).strip() if end not in (None, '') else '',
-        'answers': answers,
-    }
+    return out
+
+def read_porsline(path: str) -> dict:
+    """First respondent only — kept for callers that predate batch files."""
+    return read_porsline_all(path)[0]
 
 def _match_option(ans_norm: str, opts_norm: list) -> Optional[int]:
     """Return the 0-based option index for an answer text, or None."""
@@ -232,11 +245,11 @@ def _match_option(ans_norm: str, opts_norm: list) -> Optional[int]:
             return i
     return None
 
-def score_survey(path: str) -> dict:
-    """Score a Porsline export against the bundled v2 scoring model and
-    return the same data shape build_html() consumes, plus person/dates."""
+def _score_respondent(pors: dict) -> dict:
+    """Score one parsed respondent (a read_porsline_all() entry) against the
+    bundled v2 scoring model and return the data shape build_html() consumes,
+    plus person/dates."""
     model = _load_scoring_model()
-    pors = read_porsline(path)
     ans_by_q = pors['answers']
 
     total = len(model)
@@ -295,23 +308,34 @@ def score_survey(path: str) -> dict:
         'archetype': arche,
         'archetype_fa': ARCHETYPE_FA[arche],
         'person_name': pors['name'],
+        'phone': pors.get('phone', ''),
         'start_date': pors['start_date'],
         'end_date': pors['end_date'],
-        # report date = survey completion time (BW), falling back to start (BV)
+        # report date = survey completion time («تاریخ اتمام»), else start
         'report_date': jalali_display(pors['end_date']) or jalali_display(pors['start_date']),
     }
 
 
-def score_workbook(path: str) -> dict:
-    """Dispatch on file shape: a Porsline export (single 'Results' sheet) goes
-    through the v2 survey scorer; a legacy Questions/Responses workbook goes
-    through the original engine."""
+def score_survey(path: str) -> dict:
+    """Score the first respondent of a Porsline export (pre-batch behavior)."""
+    return _score_respondent(read_porsline(path))
+
+
+def score_workbook_all(path: str) -> list:
+    """Score every respondent in the workbook, in file order. A Porsline
+    export (single 'Results' sheet) may carry one row or a whole batch; a
+    legacy Questions/Responses workbook is always a single respondent."""
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     sheets = set(wb.sheetnames)
     wb.close()
     if 'Results' in sheets:
-        return score_survey(path)
-    return _score_legacy_workbook(path)
+        return [_score_respondent(p) for p in read_porsline_all(path)]
+    return [_score_legacy_workbook(path)]
+
+
+def score_workbook(path: str) -> dict:
+    """First respondent only — kept for callers that predate batch files."""
+    return score_workbook_all(path)[0]
 
 
 def _score_legacy_workbook(path: str) -> dict:
@@ -926,14 +950,53 @@ html,body{{font-family:'Vazir',sans-serif;color:#F4EEFA;background:#0f0b18;-webk
 
 
 # ===== renderer =====
-def render_html_to_pdf(html_str: str, pdf_path: str) -> None:
-    with sync_playwright() as p:
-        b = p.chromium.launch(args=['--no-sandbox'])
-        pg = b.new_page()
+def _render_pages(browser, jobs) -> None:
+    pg = browser.new_page()
+    for html_str, pdf_path in jobs:
         pg.set_content(html_str, wait_until='networkidle')
         pg.pdf(path=pdf_path, format='A4', print_background=True,
                margin={'top':'0','bottom':'0','left':'0','right':'0'})
+    pg.close()
+
+def render_html_to_pdf(html_str: str, pdf_path: str) -> None:
+    with sync_playwright() as p:
+        b = p.chromium.launch(args=['--no-sandbox'])
+        _render_pages(b, [(html_str, pdf_path)])
         b.close()
+
+def safe_pdf_name(name: str) -> str:
+    """'<sanitized person>.pdf' — Persian letters kept, filesystem junk not."""
+    safe = re.sub(r'[^\w\u0600-\u06FF\- ]', '', name).strip() if name else ''
+    safe = re.sub(r'\s+', '_', safe)
+    return f"{safe}.pdf" if safe else "chakra-report.pdf"
+
+def render_reports(datas: list, out_dir: str, name_override: str = '',
+                   date_str: str = '') -> list:
+    """Render one PDF per scored respondent into out_dir, reusing a single
+    Chromium instance (a per-PDF launch is ~2s of pure overhead — fatal for a
+    50-person batch inside an HTTP timeout). Files are named after the person,
+    deduped with _2, _3… on collisions. name_override only applies when there
+    is exactly one respondent — a batch reads every name from the file.
+    Returns [(pdf_path, person_name, data), ...] in file order."""
+    fonts = _load_fonts()
+    jobs, meta, used = [], [], set()
+    for i, data in enumerate(datas, 1):
+        person = (name_override or '').strip() if len(datas) == 1 else ''
+        person = person or data.get('person_name', '') or f'respondent-{i}'
+        fname = safe_pdf_name(person)
+        stem, n = fname[:-4], 2
+        while fname in used:
+            fname, n = f'{stem}_{n}.pdf', n + 1
+        used.add(fname)
+        pdf_path = os.path.join(out_dir, fname)
+        jobs.append((build_html(data, fonts, person_name=person,
+                                date_str=date_str), pdf_path))
+        meta.append((pdf_path, person, data))
+    with sync_playwright() as p:
+        b = p.chromium.launch(args=['--no-sandbox'])
+        _render_pages(b, jobs)
+        b.close()
+    return meta
 
 # ===== main =====
 if __name__ == '__main__':
@@ -941,7 +1004,19 @@ if __name__ == '__main__':
     out_pdf = sys.argv[2]
     person  = sys.argv[3] if len(sys.argv) > 3 else ''
     datestr = sys.argv[4] if len(sys.argv) > 4 else ''
-    data  = score_workbook(in_xlsx)
+    datas = score_workbook_all(in_xlsx)
+    if len(datas) > 1:
+        # batch file: the output argument is a directory, one PDF per person
+        os.makedirs(out_pdf, exist_ok=True)
+        reports = render_reports(datas, out_pdf, date_str=datestr)
+        print(json.dumps({'ok': True, 'count': len(reports),
+                          'reports': [{'pdf': p, 'person': n,
+                                       'overall': d['overall_score'],
+                                       'confidence': d['confidence']}
+                                      for p, n, d in reports]},
+                         ensure_ascii=False, indent=1))
+        sys.exit(0)
+    data  = datas[0]
     fonts = _load_fonts()
     html_str = build_html(data, fonts, person_name=person, date_str=datestr)
     render_html_to_pdf(html_str, out_pdf)
