@@ -209,7 +209,7 @@
     {
       "parameters": {
         "method": "GET",
-        "url": "=http://185.221.237.90:8099/file/{{ $json.token }}/{{ $json.idx }}",
+        "url": "=http://185.221.237.90:8099/file/{{ $('Render PDF (VPS)').first().json.token }}/{{ $json.idx }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -237,7 +237,7 @@
         400
       ],
       "onError": "continueRegularOutput",
-      "notes": "Pulls one rendered PDF by index from the VPS. responseFormat=file -> binary 'data' for the Telegram node; the Content-Disposition carries the Persian filename. Same X-Auth-Token as the render call. onError continues so one missing/expired file can't abort the rest of the batch."
+      "notes": "Pulls one rendered PDF by index from the VPS. The token is read from the render node ($('Render PDF (VPS)').first().json.token) — it is the same for the whole batch and, unlike a per-item field, survives Split Out + the loop, so the URL is never /file//<idx>. idx comes from the split item. responseFormat=file -> binary 'data' for the Telegram node; Content-Disposition carries the Persian filename. Same X-Auth-Token as the render call. onError continues so one missing file can't abort the rest of the batch."
     },
     {
       "parameters": {
@@ -259,15 +259,15 @@
       "webhookId": "5aea1501-058c-4ba4-8992-62bb13f0b313",
       "onError": "continueRegularOutput",
       "retryOnFail": true,
-      "maxTries": 3,
-      "waitBetweenTries": 5000,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
       "credentials": {
         "telegramApi": {
           "id": "cWt2loWBfcYWXkku",
           "name": "Chakra bot"
         }
       },
-      "notes": "Sends one report as its own document — the 'regular format' the client asked for (no ZIP). .first() for the chat id: item pairing back to the trigger is lost after the split/loop. Retries 3x, 5 s apart, so a transient Telegram 429 self-heals; onError continues so a single failed send doesn't drop the remaining reports. Filename comes from the VPS Content-Disposition header."
+      "notes": "Sends one report as its own document — the 'regular format' the client asked for (no ZIP). .first() for the chat id: item pairing back to the trigger is lost after the split/loop. Retries once (3 s later) so a transient Telegram 429 self-heals, but the cost stays bounded so a systemic failure can't drag the run out for minutes. onError continues so a single failed send doesn't drop the remaining reports. Filename comes from the VPS Content-Disposition header."
     },
     {
       "parameters": {
