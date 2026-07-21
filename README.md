@@ -13,9 +13,9 @@ maps each text answer back onto it to compute the scores.
 
 The export may hold **one respondent or a whole batch** (one row each — Porsline's
 "download all results" file). Either way **every respondent comes back as its own PDF** —
-one document per person, named after them — sent into the chat one at a time. No ZIP: the
-client wanted the plain PDFs, and the bot **paces** the sends so Telegram never flood-limits
-the chat.
+one document per person, named after them. No ZIP: the client forwards each person their own
+report, so they need separate files. The **VPS sends each PDF to Telegram itself**, paced
+(with proper `429` back-off) so the bot never gets flood-limited or banned.
 
 Built for **Nazarban Studio** / nazarbanai.com. Persian-first (RTL, Vazirmatn), dark
 editorial report design.
@@ -28,11 +28,14 @@ editorial report design.
 Owner (Telegram)
    │  1. sends the Porsline survey .xlsx (one person — or a batch export)
    ▼
-n8n (cloud)  ──2. POST /report (file)──►  VPS service
-   │             ◄─ manifest {count, token,   reads names → scores → renders every PDF →
-   │                files:[…]}                holds them under a one-time token
-   │  3. for each report: GET /file/<token>/<idx> → send <name>.pdf into the chat
-   │     (one at a time, ~2 s apart, so Telegram doesn't rate-limit the bot)
+n8n (cloud) ──2. POST /deliver (file + chat id)──►  VPS service
+                    ◄─ {ok, accepted} in <1 s        (then renders + sends on its own)
+                                                       │
+   the VPS, on a background thread:                    │
+     • posts a "⏳ working…" note                       │
+     • renders every respondent → its own PDF          │
+     • sends each PDF into the chat, ~2 s apart  ◄──────┘
+     • clears the note (or posts an error)
    ▼
 Owner receives one PDF per person
 ```
@@ -42,10 +45,10 @@ Owner receives one PDF per person
   («نام و نام خانوادگی»), so the service reads it from the uploaded file and uses it as both
   the in-report name and the PDF filename. (An explicit `name` can still be POSTed to
   override it — single-person files only; a batch always names from the file.)
-- **One render call per file** (`/report`) returns a manifest; the PDFs are then pulled one
-  per person from `/file/<token>/<idx>`. Nothing is keyed by chat, so a burst of files can't
-  overwrite each other — send 50 files, or one batch file with 21 rows; every report comes
-  back. n8n holds no state, no Code nodes.
+- **n8n just forwards.** It hands the file + chat id to `/deliver` and is done in under a
+  second; the VPS renders and sends everything itself. A burst of files can't collide (nothing
+  is keyed by chat) — send 50 files, or one batch file with 21 rows; every report comes back.
+  n8n holds no state, no Code nodes — **3 nodes total**.
 
 ---
 
@@ -59,14 +62,15 @@ Runs under **systemd** as the `chakra` service, behind **gunicorn** (2 workers).
 - Host: `185.221.237.90`, port `8099`
 - Port locked with an iptables rule to only accept traffic from the n8n server + localhost
 - Renders PDFs with headless Chromium via Playwright
+- **Sends the finished PDFs to Telegram itself** (outbound to `api.telegram.org`), with
+  pacing + `429` back-off. Needs `TELEGRAM_BOT_TOKEN` in the environment.
 
 ### 2. n8n (cloud) — the orchestration
-A workflow (`chakra_bot_workflow.json`) that:
+A tiny **3-node** workflow (`chakra_bot_workflow.json`) that:
 - Listens for Telegram messages (Telegram Trigger, "Download Files" ON)
 - Routes on message type (IF: is it a document?)
-- POSTs the file to the VPS and gets back a manifest of rendered reports
-- Loops the manifest, fetching and sending each PDF as its own document — **paced** (one
-  every ~2 s, with retry) so Telegram never flood-limits the chat
+- POSTs the file + chat id to the VPS `/deliver` and returns — the VPS does **all** the
+  rendering and Telegram sending itself, so n8n never loops or waits
 
 n8n is imported/configured through the n8n Cloud UI — it is **not** in this repo, but the
 workflow JSON to import lives here.
@@ -77,12 +81,12 @@ workflow JSON to import lives here.
 
 | File | Runs on | Purpose |
 |------|---------|---------|
-| `server.py` | VPS | Flask HTTP service. Endpoints: `/health`, `/upload`, `/render`, `/report`, `/file/<token>/<idx>`. |
+| `server.py` | VPS | Flask HTTP service + Telegram delivery. Endpoints: `/health`, `/deliver` (what the bot uses), `/upload`, `/render`, `/report`, `/file/<token>/<idx>`. |
 | `nazarban_service.py` | VPS | The engine: reads the survey, scores it, builds the HTML report, renders the PDF. Scoring + template + renderer bundled; program copy lives in `program_content.py`. |
 | `scoring_model.xlsx` | VPS | **The scoring brain.** The client's master workbook: 70 questions, their 4 options, 1–4 scores, reverse flags, and per-metric weights. The uploaded survey carries only answers; this file supplies the model. Edit weights/options here → restart. Must sit next to `nazarban_service.py`. |
 | `program_content.py` | VPS | The 4-week program copy: 7 chakras × 3 score tiers × 6 sections (sleep, water affirmation, practice, frequency, incense, diet). Pure data — edit copy here, no logic. Must sit next to `nazarban_service.py`. |
 | `fonts_b64.json` | VPS | Vazirmatn font weights (Farsi-Digits variant), base64-embedded so the PDF has zero external font deps. Must sit next to `nazarban_service.py`. |
-| `requirements.txt` | VPS | Python deps: openpyxl, flask, gunicorn, playwright. |
+| `requirements.txt` | VPS | Python deps: openpyxl, flask, gunicorn, playwright, requests. |
 
 ---
 
@@ -161,13 +165,22 @@ the systemd env). Returns 401 if it doesn't match.
 | Method | Path | Body | Returns |
 |--------|------|------|---------|
 | GET | `/health` | — | `{"ok":true,"service":"chakra-report"}` |
+| POST | `/deliver` | multipart: `file` (xlsx), `chat` (chat id) | `{"ok":true,"accepted":true}` **immediately**, then the VPS renders + sends every report into that chat itself |
 | POST | `/upload` | multipart: `file` (xlsx), `chat` (chat id) | `{"ok":true,"chat":"..."}` — stashes the file keyed by chat |
 | POST | `/render` | form or JSON: `chat` (chat id); `name` **optional** | manifest JSON (see below), one-time use — deletes the stash |
 | POST | `/report` | multipart: `file`; `name` **optional** | manifest JSON in one shot (no chat needed; kept for convenience) |
 | GET | `/file/<token>/<idx>` | — (token + index from the manifest) | one `<person>.pdf` (`application/pdf`); 404 once swept |
 
-**Render response** (`/report` and `/render`) is a small JSON manifest — one entry per
-respondent, single-person or batch alike:
+**`/deliver` is the endpoint the bot uses.** It validates the file, returns `accepted`
+within a second, and hands off to a **background thread** that: posts the «⏳ working…» note,
+renders every respondent, sends each PDF into the chat (paced `CHAKRA_SEND_INTERVAL`, default
+2 s, honouring Telegram's `429` `retry_after`), then deletes the note. An over-cap file or a
+render error is reported straight into the chat; a partial send ("X of N") is reported too.
+Requires **`TELEGRAM_BOT_TOKEN`** in the environment — without it `/deliver` returns 500.
+
+The **`/report` + `/render` + `/file` trio** below is the older manifest/pick-up flow, kept
+for direct API use; the bot no longer needs it. Its render response is a small JSON manifest —
+one entry per respondent, single-person or batch alike:
 
 ```json
 { "ok": true, "count": 2, "token": "tmpAbC123",
@@ -179,13 +192,14 @@ The rendered PDFs are held on disk under `token`; fetch each one at `GET /file/<
 (`application/pdf`, filename in `Content-Disposition`). Duplicate person names are deduped
 `_2`, `_3`…. Held files auto-expire on the render sweep (~30 min), so pick them up promptly.
 
-Batches above the cap — `CHAKRA_MAX_BATCH`, **default 30** — return `{"ok":false,"error":…}`
-(HTTP 200, so n8n relays the bilingual "split the export" message cleanly into the chat).
-**30 is the number the bot's «⏳ working…» note quotes to the owner** — if you override the
-env var, update the note text in the n8n workflow too. The old 50 MB ZIP wall is gone (each
-PDF is sent on its own, ~1 MB), so the cap is now about **render time and send pacing**, not
-file size: at ~2 s/PDF to render plus ~2 s/PDF to send, 30 people is roughly two minutes end
-to end. **Don't set it above 45** without widening the render timeout and the n8n pacing.
+Batches above the cap — `CHAKRA_MAX_BATCH`, **default 30** — are rejected with a bilingual
+"split the export" message: `/deliver` posts it straight into the chat, `/report` returns it
+as `{"ok":false,"error":…}` (HTTP 200). **30 is the number the bot's «⏳ working…» note quotes
+to the owner** — if you override the env var, update the note text too (it now lives in
+`server.py`'s `_WORKING_NOTE`, not the n8n workflow). The old 50 MB ZIP wall is gone (each PDF
+is sent on its own, ~1 MB), so the cap is about **render time and send pacing**, not file
+size: ~2 s/PDF to render plus ~2 s/PDF to send, so 30 people is roughly two minutes end to
+end. **Don't set it above 45** without widening the render timeout and `CHAKRA_SEND_INTERVAL`.
 
 Renders take a **global lock** (one Chromium at a time across both workers): on a 1-vCPU
 box concurrent renders don't finish any sooner, but they double peak RAM. Batches that
@@ -221,8 +235,19 @@ journalctl -u chakra -n 30 --no-pager   # logs if something fails
 curl -s http://localhost:8099/health    # confirm it answers
 ```
 
-The unit sets `NAZARBAN_TOKEN` and runs:
-`gunicorn -w 2 -b 0.0.0.0:8099 --timeout 120 server:app`
+The unit sets two secrets in its environment and runs gunicorn:
+
+```ini
+Environment=NAZARBAN_TOKEN=<shared secret, must match the n8n X-Auth-Token>
+Environment=TELEGRAM_BOT_TOKEN=<the BotFather token, for sending PDFs to Telegram>
+# optional: Environment=CHAKRA_SEND_INTERVAL=2   (seconds between sends)
+ExecStart=/usr/local/bin/gunicorn -w 2 -b 0.0.0.0:8099 --timeout 300 server:app
+```
+
+`TELEGRAM_BOT_TOKEN` is required now that the VPS sends the reports itself — without it
+`/deliver` returns 500. After adding it: `systemctl daemon-reload && systemctl restart chakra`.
+The VPS must be able to reach `api.telegram.org` outbound (verify with
+`curl -s -o /dev/null -w "%{http_code}\n" https://api.telegram.org`).
 
 ### Batch capacity on this VPS (1 vCPU, 2 GB RAM, tmpfs /tmp)
 
@@ -242,9 +267,9 @@ ExecStart=/usr/local/bin/gunicorn -w 2 -b 0.0.0.0:8099 --timeout 300 server:app
 
 then `systemctl daemon-reload && systemctl restart chakra`. No `CHAKRA_MAX_BATCH` line is
 needed for the standard 30 — the env var exists only to override it (up to ~45; above that,
-widen `--timeout` and the n8n pacing, and update the bot's note text). `/tmp` is tmpfs (RAM):
-a rendering batch holds ~65 MB of PDFs there until the pick-ups finish or the sweep reclaims
-them (~30 min); orphans are swept.
+widen `--timeout` and `CHAKRA_SEND_INTERVAL`, and update `_WORKING_NOTE`). `/tmp` is tmpfs
+(RAM): a rendering batch holds ~65 MB of PDFs there until delivery finishes (the worker
+deletes each token dir when done); orphans are swept after ~30 min.
 
 > **Always use gunicorn, not `python3 server.py`.** The Flask dev server is single-threaded
 > and hangs when Chromium launches inside a request. gunicorn's worker processes fix this.
@@ -258,79 +283,63 @@ them (~30 min); orphans are swept.
 
 ## The n8n workflow
 
-Import `chakra_bot_workflow.json` into n8n Cloud. Still no Code nodes and no state — and
-**safe to run many at once**. The flow renders once, then loops the manifest to send each
-report on its own, paced:
+Import `chakra_bot_workflow.json` into n8n Cloud. **Three nodes**, no Code nodes, no state —
+all the real work is on the VPS now, so there's almost nothing here to break:
 
 1. **Telegram Trigger** — Download Files ON. Each uploaded file is its own message.
-2. **Is it a file?** (IF) — TRUE = a document → process it. FALSE = plain text → ignored.
-3. **Send Working Note** (Telegram) — instantly posts «⏳ در حال ساخت و ارسال گزارش‌ها…» and
-   states the **30-people-per-file limit**. Sits on a **parallel branch**: a Telegram node
-   placed inline before the HTTP request would strip the xlsx binary off the item.
-4. **Render PDF (VPS)** (HTTP) — POST `/report` with the xlsx binary. The VPS renders every
-   respondent and returns a **manifest** `{count, token, files:[…]}` (not a file).
-   **Stateless** — no `chat`/`name` passed, so concurrent calls never collide. *On error the
-   flow continues* into…
-5. **Render OK?** (IF) — is `count > 0`? TRUE → fan out. FALSE → report the failure.
-6. **Split Reports** (Split Out) — one item per person, each carrying the `token`.
-7. **Loop Over Reports** (Loop Over Items, batch 1) — walks the reports one at a time; its
-   "done" output cleans up, its "loop" output sends the next report.
-8. **Fetch PDF (VPS)** (HTTP) — GET `/file/<token>/<idx>` → the person's PDF as binary.
-9. **Send PDF Report** (Telegram) — sends that one `<name>.pdf` into the chat. **Retries 3×**
-   on a Telegram `429`, and continues on error so one bad send doesn't drop the rest.
-10. **Pace (Wait)** — waits **2 s**, then loops back. This is the rate-limit guard: ~1 doc /
-    2 s to one chat stays under Telegram's ~1 msg/s flood limit. Raise it if you widen the cap.
-11. **Once** (Limit 1) — the loop's "done" output carries every item; keep one so the working
-    note is deleted a single time.
-12. **Send Error** (Telegram) — relays the VPS error into the chat (e.g. the bilingual
-    "batch of 52 exceeds the limit of 30 — split the export").
-13. **Delete Working Note** (Telegram) — removes the ⏳ note once all reports (or the error)
-    have been delivered, so the chat stays clean.
+2. **Is it a file?** (IF) — TRUE = a document → hand it over. FALSE = plain text → ignored.
+3. **Deliver (VPS)** (HTTP) — POST `/deliver` with the xlsx binary **and** the chat id. The
+   VPS answers `{ok, accepted}` in under a second and does everything else on its own
+   background thread: the «⏳ working…» note, rendering, sending each PDF (paced, with `429`
+   back-off), clearing the note, and reporting any error straight into the chat.
+
+The working note, the per-report sending, the retries, the error message, and the cleanup all
+moved into `server.py` (`_deliver_worker`) — where they can be tested and where the pacing can
+honour Telegram's `retry_after`.
 
 ### Config after import
-- Attach the Telegram bot credential (BotFather token) to the **Telegram nodes**
-  (Working Note, PDF Report, Error, Delete Note) + the Trigger.
-- Set `X-Auth-Token` = your `NAZARBAN_TOKEN` in **both** HTTP nodes (Render PDF, Fetch PDF).
-- URL is pre-filled with the VPS IP (`185.221.237.90:8099`) in both.
-- Activate, then smoke-test all three paths: a normal file (⏳ appears → PDF arrives → ⏳
-  vanishes), a batch file (several PDFs arrive one after another, ~2 s apart), and an
-  over-30-row file (⏳ → ❌ error message → ⏳ vanishes).
+- Attach the Telegram bot credential (BotFather token) to the **Trigger** — that's the only
+  Telegram node left; the VPS does the actual sending with its own `TELEGRAM_BOT_TOKEN`.
+- Set `X-Auth-Token` = your `NAZARBAN_TOKEN` in the **Deliver (VPS)** HTTP node.
+- URL is pre-filled with the VPS IP (`185.221.237.90:8099/deliver`).
+- On the VPS, set `TELEGRAM_BOT_TOKEN` (the same BotFather token) and confirm it can reach
+  `api.telegram.org` (see "Running the service").
+- Activate, then smoke-test: a normal file (⏳ appears → PDF arrives → ⏳ vanishes), a batch
+  file (several PDFs arrive one after another, ~2 s apart), and an over-30-row file
+  (⏳ → ❌ "split the export" → ⏳ vanishes).
 
 ### Many people at once (batches)
 Two ways, both supported:
 
 **One batch file** (how the client sends them now): the Porsline "download all results"
-export with one row per person. `/report` scores every row and renders every PDF in a single
-Chromium session, then returns a manifest; the bot **sends each report as its own document**,
-one every ~2 s. Capped at **30 people per file** (`CHAKRA_MAX_BATCH` — see "Batch capacity"
-above); the bot's working note states this limit, and an over-the-cap file gets a bilingual
-"split the export" message in the chat.
+export, one row per person. The VPS scores every row, renders every PDF in a single Chromium
+session, and **sends each report as its own document**, ~2 s apart. Capped at **30 people per
+file** (`CHAKRA_MAX_BATCH` — see "Batch capacity" above); the working note states the limit,
+and an over-the-cap file gets a bilingual "split the export" message in the chat.
 
-**Many single files:** Telegram delivers each file as a separate message, so 50 files = 50
-independent executions, each its own `/report` call. Because `/report` is stateless (nothing
-is keyed by chat), they can't overwrite each other — unlike the old `/upload`+`/render` pair,
-which kept **one stashed file per chat** and would clobber itself under concurrency.
+**Many single files:** Telegram delivers each file as its own message, so 50 files = 50
+independent `/deliver` calls. Nothing is keyed by chat, so they can't overwrite each other —
+unlike the old `/upload`+`/render` pair, which kept one stashed file per chat and would
+clobber itself under concurrency.
 
-Throughput is bounded by two things: PDF rendering on the VPS (**~2.4 s per single file** —
-browser launch + render; scoring is ~0.1 s), and **paced delivery** (~2 s per report so
-Telegram doesn't flood-limit the chat). Renders are **serialized by a global lock** — on a
-1-vCPU box parallel renders finish no sooner and only multiply peak RAM, so extra gunicorn
-workers add responsiveness (health checks, uploads, rejects answer instantly) but not render
-speed. A 30-row batch is roughly a minute to render plus a minute to send. n8n Cloud's own
-execution-concurrency cap naturally paces the render requests, so the VPS won't be stampeded.
+Throughput is bounded by two things: PDF rendering (**~2.4 s per single file** — browser
+launch + render; scoring is ~0.1 s), and **paced delivery** (~2 s per report). Renders are
+**serialized by a global lock**; sending is I/O, not CPU, and the lock is released *before*
+it, so one batch's sending never blocks the next batch's render. A 30-row batch is roughly a
+minute to render plus a minute to send.
 
 ### Design decisions worth knowing
-- **No Code nodes.** They're flaky on n8n Cloud and caused an "unknown error" earlier. n8n only
-  passes values it reads natively; all the logic lives on the VPS.
-- **Stateless render.** The bot uses the one-shot `/report` (file in → manifest out; each PDF
-  then pulled by `token`+`idx`) instead of the `/upload`+`/render` stash. Nothing is keyed by
-  chat, so nothing can be clobbered when files arrive together. (`/upload` + `/render` are still
-  in the service for the old two-message pattern, but the bot no longer uses them.)
-- **Paced sending, not a ZIP.** A batch used to come back as one ZIP; the client wanted the
-  plain PDFs. So the bot sends each report as its own document, throttled to ~1 every 2 s by
-  the Loop + Wait pair, with a retry on Telegram's `429`. That keeps bulk sends under
-  Telegram's per-chat flood limit — the alternative, firing 30 documents at once, risks a
-  temporary send ban.
+- **No Code nodes, and now barely any nodes.** Code nodes are flaky on n8n Cloud (caused an
+  "unknown error" earlier); n8n now only forwards the file, and all logic lives on the VPS.
+- **The VPS sends to Telegram, not n8n.** Delivering many separate PDFs means many sends, and
+  doing that through an n8n loop proved fragile (field-passing across Split Out, binary
+  handling, per-item retries — two different failures in practice). Moving it into `server.py`
+  makes it testable and lets the pacing honour Telegram's `429` `retry_after`, which n8n's
+  fixed retry could not. Trade-off: the VPS needs the bot token and must reach
+  `api.telegram.org` (confirmed reachable). See `_deliver_worker`.
+- **Background delivery.** `/deliver` returns immediately and renders+sends on a daemon thread,
+  so neither n8n nor a gunicorn worker waits on the ~minute of work. Errors and partial-send
+  summaries ("X of N sent") go straight into the chat, so a failure is never silent.
 - **No name prompt.** The respondent's name is a field inside the survey («نام و نام
   خانوادگی», located by header text), so the VPS reads it from the uploaded file. This removed the old "who is this for?" message, the
   second Telegram execution, and the state-matching that went with it.
@@ -363,13 +372,16 @@ After editing, redeploy: upload the changed file to `/chakra`, `systemctl restar
 
 - Port 8099 is firewalled (iptables) to only the n8n server IP + localhost.
 - Shared-secret token (`NAZARBAN_TOKEN`) on every POST endpoint.
-- Chat ids and filenames are sanitized before touching the filesystem.
+- **`TELEGRAM_BOT_TOKEN`** now lives on the VPS too (needed to send the reports). Keep it in
+  the systemd env, same as `NAZARBAN_TOKEN` — not in the repo. Outbound TLS to
+  `api.telegram.org` only.
+- Chat ids and filenames (and the `/file` token) are sanitized before touching the filesystem.
 - Upload validation: rejects non-.xlsx files and non-zip content (magic bytes).
 - Request size limit: 10 MB max.
-- Structured logging (INFO level) on uploads and errors.
-- Currently HTTP (not HTTPS). Fine for a private single-owner bot moving non-sensitive
-  survey data. Upgrade path: put the service behind a reverse proxy with a TLS cert if it
-  ever grows or handles sensitive data — no code changes needed.
+- Structured logging (INFO level) on uploads, delivery, and errors.
+- Inbound is still HTTP (not HTTPS) — fine for a private single-owner bot behind the firewall.
+  Outbound to Telegram is HTTPS. Upgrade path: put the service behind a reverse proxy with a
+  TLS cert if it ever grows or handles sensitive data — no code changes needed.
 
 ---
 

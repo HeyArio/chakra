@@ -3,29 +3,34 @@
 Chakra report HTTP service.
 
 Designed so n8n needs NO code nodes and NO state of its own.
-The VPS remembers the last uploaded file per Telegram chat.
 
 Endpoints:
   GET  /health
+  POST /deliver       file=<xlsx>, chat=<chat_id>    -> {ok}; sends to Telegram
   POST /report        file=<xlsx>, name=<str>       -> manifest JSON (one-shot)
   POST /upload        file=<xlsx>, chat=<chat_id>    -> {ok}  (stash by chat)
   POST /render        chat=<chat_id>, name=<str>     -> manifest JSON (stashed file)
   GET  /file/<tok>/<i>                               -> one PDF (pick-up by index)
 
-A Porsline export may carry one respondent (the old per-person file) or a
-whole batch, one row each. Either way every respondent is rendered to its
-OWN PDF and the request returns a small JSON manifest — no ZIP. The rendered
-PDFs are held on disk under a one-time token; n8n reads the manifest, then
-fetches and sends each PDF to Telegram as its own document, PACED so
-Telegram's per-chat flood limit is never tripped (see the n8n workflow's
-"Loop Over Reports" + "Pace" nodes). Held files auto-expire on the render
-sweep even if a pick-up never happens.
+/deliver is what the bot uses now. n8n just forwards the xlsx + the chat id;
+the VPS renders every respondent and sends each PDF straight into the chat
+ITSELF — greeting note, one document per person (paced, with 429 back-off),
+then it clears the note — all on a background thread, so n8n does no looping
+and nothing waits on the ~minute of sending. Talking to Telegram from Python
+is what lets the pacing/retry actually honour retry_after; n8n's fixed retry
+could not. Needs TELEGRAM_BOT_TOKEN in the environment.
 
-Pending uploads live in a temp dir, one slot per chat, auto-expire after TTL.
+The older /report + /render + /file trio (render -> manifest -> pick up each
+PDF by index) stays for direct API use; the bot no longer needs it. A Porsline
+export may carry one respondent or a whole batch (one row each) — either way
+every respondent becomes its own PDF, never a ZIP.
+
+Pending uploads live in a temp dir, auto-expire after TTL.
 """
-import os, tempfile, shutil, json, re, time, logging, fcntl
+import os, tempfile, shutil, json, re, time, logging, fcntl, threading
 from contextlib import contextmanager
 from flask import Flask, request, send_file, jsonify
+import requests
 
 import nazarban_service as svc
 
@@ -33,6 +38,13 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10 MB
 
 TOKEN = os.environ.get('NAZARBAN_TOKEN', '')
+
+# Telegram delivery: the VPS posts each PDF to the chat itself (n8n no longer
+# loops). Needs the BotFather token. SEND_INTERVAL paces the sends so the
+# per-chat flood limit is never tripped; a 429 is still honoured exactly.
+TG_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TG_API = 'https://api.telegram.org/bot' + TG_TOKEN
+SEND_INTERVAL = float(os.environ.get('CHAKRA_SEND_INTERVAL', '2'))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('chakra')
@@ -122,6 +134,100 @@ def _stash_reports(in_path, name, date=''):
     with open(os.path.join(td, 'manifest.json'), 'w', encoding='utf-8') as mf:
         json.dump(manifest, mf, ensure_ascii=False)
     return {'ok': True, 'count': len(files), 'token': token, 'files': files}
+
+# ---- Telegram delivery ----------------------------------------------------
+# The VPS talks to the Bot API directly so each report lands as its own
+# document. Pacing + 429 back-off live here, in Python, where they can be
+# tested and can honour Telegram's retry_after — n8n's fixed retry could not.
+_WORKING_NOTE = ('⏳ دریافت شد — در حال ساخت و ارسال گزارش‌ها…\n'
+                 'حداکثر ۳۰ نفر در هر فایل اکسل؛ برای فایل گروهی، گزارش‌ها '
+                 'یکی‌یکی فرستاده می‌شوند و کمی طول می‌کشد.')
+_ERR_GENERIC = ('❌ ساخت گزارش ناموفق بود. فایل را بررسی کنید — '
+                'حداکثر ۳۰ نفر در هر فایل اکسل.')
+_CAPTION = 'گزارش تحلیل انرژی شما آماده است 🌿\nChakra · Nazarbanai'
+
+def _tg(method, **kw):
+    return requests.post(TG_API + '/' + method, timeout=60, **kw)
+
+def tg_send_message(chat, text):
+    """Post a text message; return its message_id (or None on failure)."""
+    try:
+        j = _tg('sendMessage', data={'chat_id': chat, 'text': text}).json()
+        return j.get('result', {}).get('message_id') if j.get('ok') else None
+    except Exception:
+        log.exception('tg sendMessage failed chat=%s', chat)
+        return None
+
+def tg_delete_message(chat, message_id):
+    try:
+        _tg('deleteMessage', data={'chat_id': chat, 'message_id': message_id})
+    except Exception:
+        log.exception('tg deleteMessage failed chat=%s', chat)
+
+def tg_send_document(chat, path, filename, caption=None, max_tries=4):
+    """Upload one PDF, honouring Telegram's 429 retry_after. Returns True on
+    delivery, False once the tries are spent."""
+    for attempt in range(1, max_tries + 1):
+        try:
+            with open(path, 'rb') as fh:
+                data = {'chat_id': chat}
+                if caption:
+                    data['caption'] = caption
+                r = _tg('sendDocument', data=data,
+                        files={'document': (filename, fh, 'application/pdf')})
+            if r.status_code == 200 and r.json().get('ok'):
+                return True
+            if r.status_code == 429:
+                wait = r.json().get('parameters', {}).get('retry_after', 5)
+                log.warning('429 chat=%s; honouring retry_after=%ss', chat, wait)
+                time.sleep(wait + 1)
+                continue  # a 429 attempt doesn't count against max_tries
+            log.warning('sendDocument chat=%s http=%s body=%s',
+                        chat, r.status_code, r.text[:200])
+        except Exception:
+            log.exception('sendDocument exception chat=%s', chat)
+        time.sleep(2 * attempt)  # brief back-off before the next try
+    return False
+
+def _deliver_worker(in_path, chat):
+    """Background job: greet, render every report, send each as its own PDF
+    (paced), then clear the greeting. Runs off the request thread so neither
+    n8n nor a gunicorn worker waits on the ~minute of sending."""
+    note_id = tg_send_message(chat, _WORKING_NOTE)
+    token = None
+    try:
+        try:
+            payload = _stash_reports(in_path, name='')
+        except BatchTooLarge as e:
+            tg_send_message(chat, '❌ ' + str(e))
+            return
+        token, files = payload['token'], payload['files']
+        total = len(files)
+        caption = _CAPTION if total == 1 else None  # skip 20x repetition
+        sent = 0
+        for i, f in enumerate(files):
+            pdf = os.path.join(RENDER_DIR, token, f['filename'])
+            if tg_send_document(chat, pdf, f['filename'], caption=caption):
+                sent += 1
+            if i < total - 1:
+                time.sleep(SEND_INTERVAL)  # pace to stay under the flood limit
+        log.info('deliver done chat=%s sent=%d/%d', chat, sent, total)
+        if sent < total:
+            tg_send_message(
+                chat, f'⚠️ {sent} از {total} گزارش ارسال شد؛ '
+                      f'بقیه ناموفق بود — لطفاً دوباره تلاش کنید.')
+    except Exception:
+        log.exception('deliver worker failed chat=%s', chat)
+        tg_send_message(chat, _ERR_GENERIC)
+    finally:
+        if note_id:
+            tg_delete_message(chat, note_id)
+        if token:
+            shutil.rmtree(os.path.join(RENDER_DIR, token), ignore_errors=True)
+        try:
+            os.remove(in_path)
+        except OSError:
+            pass
 
 def _sweep():
     now = time.time()
@@ -248,6 +354,37 @@ def fetch_file(token, idx):
         return jsonify(ok=False, error='report gone'), 404
     return send_file(fpath, mimetype='application/pdf', as_attachment=True,
                      download_name=entry['filename'])
+
+@app.route('/deliver', methods=['POST'])
+def deliver():
+    """One-call delivery: n8n hands over the xlsx + chat id and returns right
+    away; the VPS renders and sends every report itself, in the background."""
+    if not _auth_ok():
+        return jsonify(ok=False, error='unauthorized'), 401
+    if not TG_TOKEN:
+        log.error('deliver called but TELEGRAM_BOT_TOKEN is not set')
+        return jsonify(ok=False, error='bot token not configured'), 500
+    if 'file' not in request.files:
+        return jsonify(ok=False, error='no file field'), 400
+    chat = _chat_key(request.form.get('chat', ''))
+    if not chat:
+        return jsonify(ok=False, error='no chat id'), 400
+    f = request.files['file']
+    if not f.filename or not f.filename.lower().endswith('.xlsx'):
+        return jsonify(ok=False, error='only .xlsx files accepted'), 400
+    head = f.stream.read(4)
+    f.stream.seek(0)
+    if head[:2] != b'PK':
+        return jsonify(ok=False, error='invalid xlsx file'), 400
+    _sweep()
+    # persist past the request: the worker (not this request) owns the file
+    fd, in_path = tempfile.mkstemp(suffix='.xlsx', dir=STORE_DIR)
+    os.close(fd)
+    f.save(in_path)
+    threading.Thread(target=_deliver_worker, args=(in_path, chat),
+                     daemon=True).start()
+    log.info('deliver accepted chat=%s file=%s', chat, f.filename)
+    return jsonify(ok=True, accepted=True)
 
 if __name__ == '__main__':
     log.info('chakra starting on port %s', os.environ.get('PORT', '8099'))

@@ -15,7 +15,7 @@
       "type": "n8n-nodes-base.telegramTrigger",
       "typeVersion": 1.1,
       "position": [
-        -464,
+        -320,
         144
       ],
       "webhookId": "chakra-report-bot",
@@ -25,7 +25,7 @@
           "name": "Chakra bot"
         }
       },
-      "notes": "Download Files ON. Each uploaded .xlsx arrives as its own message, so sending 50 files = 50 independent executions (no name reply needed anymore)."
+      "notes": "Download Files ON. Each uploaded .xlsx arrives as its own message; the VPS does everything else (greeting note, render, send each PDF, cleanup), so this workflow only has to hand the file over."
     },
     {
       "parameters": {
@@ -56,38 +56,15 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        -224,
+        -80,
         144
       ],
-      "notes": "TRUE = a document arrived -> render it. FALSE = plain text -> ignored (no name step anymore)."
-    },
-    {
-      "parameters": {
-        "operation": "sendMessage",
-        "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
-        "text": "⏳ دریافت شد — در حال ساخت و ارسال گزارش‌ها…\nحداکثر ۳۰ نفر در هر فایل اکسل؛ برای فایل گروهی، گزارش‌ها یکی‌یکی فرستاده می‌شوند و کمی طول می‌کشد.",
-        "additionalFields": {}
-      },
-      "id": "a1f6f0d2-7c31-4e5e-9b7e-2f4f7a6f9c01",
-      "name": "Send Working Note",
-      "type": "n8n-nodes-base.telegram",
-      "typeVersion": 1.2,
-      "position": [
-        16,
-        16
-      ],
-      "credentials": {
-        "telegramApi": {
-          "id": "cWt2loWBfcYWXkku",
-          "name": "Chakra bot"
-        }
-      },
-      "notes": "Instant '⏳ working…' note. States the 30-people-per-file limit and warns a group file is sent one report at a time. Runs on a PARALLEL branch: a Telegram node placed inline before the HTTP request would strip the xlsx binary off the item. Deleted again by 'Delete Working Note' once every report (or an error) has been sent."
+      "notes": "TRUE = a document arrived -> hand it to the VPS. FALSE = plain text -> ignored."
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "http://185.221.237.90:8099/report",
+        "url": "http://185.221.237.90:8099/deliver",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -105,230 +82,28 @@
               "parameterType": "formBinaryData",
               "name": "file",
               "inputDataFieldName": "data"
+            },
+            {
+              "parameterType": "formData",
+              "name": "chat",
+              "value": "={{ $('Telegram Trigger').item.json.message.chat.id }}"
             }
           ]
         },
         "options": {
-          "response": {
-            "response": {
-              "responseFormat": "json"
-            }
-          },
-          "timeout": 300000
+          "timeout": 30000
         }
       },
       "id": "4634e97e-976f-4c62-beac-a36550e18d0a",
-      "name": "Render PDF (VPS)",
+      "name": "Deliver (VPS)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        16,
-        272
+        176,
+        144
       ],
       "onError": "continueRegularOutput",
-      "notes": "One-shot: sends the .xlsx, the VPS renders every respondent to its own PDF, holds them under a token, and returns a JSON manifest { count, token, files:[{idx, filename, ...}] } — NOT a file. The PDFs are pulled one at a time by 'Fetch PDF (VPS)'. Stateless -> safe to run many in parallel (the VPS serializes renders itself). Set X-Auth-Token to your VPS token. onError continues so failures reach the chat; timeout 300 s matches the VPS render budget."
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "typeValidation": "loose",
-            "version": 2
-          },
-          "conditions": [
-            {
-              "id": "has-reports",
-              "leftValue": "={{ $json.count }}",
-              "rightValue": 0,
-              "operator": {
-                "type": "number",
-                "operation": "gt"
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
-      },
-      "id": "b2e7c1a3-8d42-4f6f-8c8f-3a5b8b7e0d12",
-      "name": "Render OK?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.2,
-      "position": [
-        256,
-        272
-      ],
-      "notes": "TRUE = the manifest reports count > 0 -> fan out and send each PDF. FALSE = any failure (over-the-cap batch, VPS down, timeout — none of which carry a count) -> tell the owner instead of failing silently."
-    },
-    {
-      "parameters": {
-        "fieldToSplitOut": "files",
-        "include": "allOtherFields",
-        "options": {}
-      },
-      "id": "e1a2c3d4-1111-4b22-9c33-000000000001",
-      "name": "Split Reports",
-      "type": "n8n-nodes-base.splitOut",
-      "typeVersion": 1,
-      "position": [
-        480,
-        272
-      ],
-      "notes": "Fans the manifest's files[] into one item per person. include=allOtherFields keeps the token on every item, so each report can be fetched by /file/<token>/<idx>."
-    },
-    {
-      "parameters": {
-        "batchSize": 1,
-        "options": {}
-      },
-      "id": "e1a2c3d4-2222-4b22-9c33-000000000002",
-      "name": "Loop Over Reports",
-      "type": "n8n-nodes-base.splitInBatches",
-      "typeVersion": 3,
-      "position": [
-        704,
-        272
-      ],
-      "notes": "Paces delivery: one report per iteration. With 'Pace (Wait)' the bot sends ~1 document / 2 s into the chat — comfortably under Telegram's ~1 message/second per-chat flood limit, so a 30-person batch (~60 s of sending) never trips it. Output 0 (done) -> clean up; output 1 (loop) -> fetch + send the next PDF."
-    },
-    {
-      "parameters": {
-        "maxItems": 1
-      },
-      "id": "e1a2c3d4-5555-4b22-9c33-000000000005",
-      "name": "Once",
-      "type": "n8n-nodes-base.limit",
-      "typeVersion": 1,
-      "position": [
-        704,
-        96
-      ],
-      "notes": "The loop's 'done' output carries every item; keep only one so the working note is deleted a single time, not once per report (which would itself hammer Telegram)."
-    },
-    {
-      "parameters": {
-        "method": "GET",
-        "url": "=http://185.221.237.90:8099/file/{{ $('Render PDF (VPS)').first().json.token }}/{{ $json.idx }}",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "X-Auth-Token",
-              "value": "CHANGE_THIS_TOKEN"
-            }
-          ]
-        },
-        "options": {
-          "response": {
-            "response": {
-              "responseFormat": "file"
-            }
-          },
-          "timeout": 120000
-        }
-      },
-      "id": "e1a2c3d4-3333-4b22-9c33-000000000003",
-      "name": "Fetch PDF (VPS)",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        928,
-        400
-      ],
-      "onError": "continueRegularOutput",
-      "notes": "Pulls one rendered PDF by index from the VPS. The token is read from the render node ($('Render PDF (VPS)').first().json.token) — it is the same for the whole batch and, unlike a per-item field, survives Split Out + the loop, so the URL is never /file//<idx>. idx comes from the split item. responseFormat=file -> binary 'data' for the Telegram node; Content-Disposition carries the Persian filename. Same X-Auth-Token as the render call. onError continues so one missing file can't abort the rest of the batch."
-    },
-    {
-      "parameters": {
-        "operation": "sendDocument",
-        "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
-        "binaryData": true,
-        "additionalFields": {
-          "caption": "گزارش تحلیل انرژی شما آماده است 🌿\nChakra · Nazarbanai"
-        }
-      },
-      "id": "58d094a5-20f0-4b4e-9944-13c8016d38d8",
-      "name": "Send PDF Report",
-      "type": "n8n-nodes-base.telegram",
-      "typeVersion": 1.2,
-      "position": [
-        1152,
-        400
-      ],
-      "webhookId": "5aea1501-058c-4ba4-8992-62bb13f0b313",
-      "onError": "continueRegularOutput",
-      "retryOnFail": true,
-      "maxTries": 2,
-      "waitBetweenTries": 3000,
-      "credentials": {
-        "telegramApi": {
-          "id": "cWt2loWBfcYWXkku",
-          "name": "Chakra bot"
-        }
-      },
-      "notes": "Sends one report as its own document — the 'regular format' the client asked for (no ZIP). .first() for the chat id: item pairing back to the trigger is lost after the split/loop. Retries once (3 s later) so a transient Telegram 429 self-heals, but the cost stays bounded so a systemic failure can't drag the run out for minutes. onError continues so a single failed send doesn't drop the remaining reports. Filename comes from the VPS Content-Disposition header."
-    },
-    {
-      "parameters": {
-        "amount": 2,
-        "unit": "seconds"
-      },
-      "id": "e1a2c3d4-4444-4b22-9c33-000000000004",
-      "name": "Pace (Wait)",
-      "type": "n8n-nodes-base.wait",
-      "typeVersion": 1.1,
-      "position": [
-        1376,
-        400
-      ],
-      "webhookId": "chakra-pace-wait",
-      "notes": "2 s between documents, then back to the loop. Telegram tolerates ~1 message/second to a single chat; 2 s leaves headroom so bulk sends (up to 30 reports) never hit flood control or a ban. Raise it if you ever widen the batch cap."
-    },
-    {
-      "parameters": {
-        "operation": "sendMessage",
-        "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
-        "text": "={{ '❌ ساخت گزارش ناموفق بود.' + '\\n' + ((typeof $json.error === 'string' ? $json.error : ($json.error?.description || $json.error?.message)) || 'فایل را بررسی کنید — حداکثر ۳۰ نفر در هر فایل اکسل.') }}",
-        "additionalFields": {}
-      },
-      "id": "c3d8e2b4-9e53-4a70-9d90-4b6c9c8f1e23",
-      "name": "Send Error",
-      "type": "n8n-nodes-base.telegram",
-      "typeVersion": 1.2,
-      "position": [
-        480,
-        480
-      ],
-      "credentials": {
-        "telegramApi": {
-          "id": "cWt2loWBfcYWXkku",
-          "name": "Chakra bot"
-        }
-      },
-      "notes": "Relays the VPS error (e.g. 'batch of 52 exceeds the limit of 30') into the chat. The VPS returns the message as a plain string in $json.error; the typeof check also covers n8n-wrapped error objects, and the literal is the last-resort fallback."
-    },
-    {
-      "parameters": {
-        "operation": "deleteMessage",
-        "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
-        "messageId": "={{ $('Send Working Note').first().json.result?.message_id || $('Send Working Note').first().json.message_id }}"
-      },
-      "id": "d4f9f3c5-0a64-4b81-8ea1-5c7d0d9a2f34",
-      "name": "Delete Working Note",
-      "type": "n8n-nodes-base.telegram",
-      "typeVersion": 1.2,
-      "position": [
-        928,
-        96
-      ],
-      "credentials": {
-        "telegramApi": {
-          "id": "cWt2loWBfcYWXkku",
-          "name": "Chakra bot"
-        }
-      },
-      "notes": "Removes the '⏳ working…' note once all reports (or the error message) have been delivered, so the chat stays clean. Uses .first() (not .item): the note lives on a parallel branch, so paired-item tracing can't reach it. The || covers both output shapes of the Telegram node."
+      "notes": "POST /deliver with the xlsx binary + the chat id. The VPS returns {ok:true, accepted:true} within a second and does the rendering + sending on its own background thread — it posts the '⏳ working' note, sends one PDF per person (paced, with 429 back-off), clears the note, and reports any error straight into the chat. Set X-Auth-Token to your VPS NAZARBAN_TOKEN. Nothing runs after this; delivery lives on the VPS."
     }
   ],
   "pinData": {},
@@ -348,130 +123,12 @@
       "main": [
         [
           {
-            "node": "Send Working Note",
-            "type": "main",
-            "index": 0
-          },
-          {
-            "node": "Render PDF (VPS)",
+            "node": "Deliver (VPS)",
             "type": "main",
             "index": 0
           }
         ],
         []
-      ]
-    },
-    "Render PDF (VPS)": {
-      "main": [
-        [
-          {
-            "node": "Render OK?",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Render OK?": {
-      "main": [
-        [
-          {
-            "node": "Split Reports",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Send Error",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Split Reports": {
-      "main": [
-        [
-          {
-            "node": "Loop Over Reports",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Loop Over Reports": {
-      "main": [
-        [
-          {
-            "node": "Once",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Fetch PDF (VPS)",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Once": {
-      "main": [
-        [
-          {
-            "node": "Delete Working Note",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Fetch PDF (VPS)": {
-      "main": [
-        [
-          {
-            "node": "Send PDF Report",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Send PDF Report": {
-      "main": [
-        [
-          {
-            "node": "Pace (Wait)",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Pace (Wait)": {
-      "main": [
-        [
-          {
-            "node": "Loop Over Reports",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Send Error": {
-      "main": [
-        [
-          {
-            "node": "Delete Working Note",
-            "type": "main",
-            "index": 0
-          }
-        ]
       ]
     }
   },
@@ -480,7 +137,7 @@
     "executionOrder": "v1",
     "availableInMCP": false
   },
-  "versionId": "a7f1c2d3-9e4b-4c5a-8d6e-2f3a4b5c6d7e",
+  "versionId": "b8e2d4f5-1a2b-4c3d-9e6f-3a4b5c6d7e8f",
   "meta": {
     "templateCredsSetupCompleted": true,
     "instanceId": "d744e477ef36c482af21417c5323cfd0ec139dc4dc3b252b940a1eb9cd25aabf"
