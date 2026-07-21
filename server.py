@@ -7,18 +7,23 @@ The VPS remembers the last uploaded file per Telegram chat.
 
 Endpoints:
   GET  /health
-  POST /report   file=<xlsx>, name=<str>            -> PDF or ZIP (one-shot)
-  POST /upload   file=<xlsx>, chat=<chat_id>         -> {ok}  (stash by chat)
-  POST /render   chat=<chat_id>, name=<str>          -> PDF or ZIP (stashed file)
+  POST /report        file=<xlsx>, name=<str>       -> manifest JSON (one-shot)
+  POST /upload        file=<xlsx>, chat=<chat_id>    -> {ok}  (stash by chat)
+  POST /render        chat=<chat_id>, name=<str>     -> manifest JSON (stashed file)
+  GET  /file/<tok>/<i>                               -> one PDF (pick-up by index)
 
 A Porsline export may carry one respondent (the old per-person file) or a
-whole batch, one row each. One respondent -> a PDF, exactly as before.
-Several -> every report is rendered and returned as a single ZIP of PDFs
-named after the people; n8n forwards it to Telegram like any document.
+whole batch, one row each. Either way every respondent is rendered to its
+OWN PDF and the request returns a small JSON manifest — no ZIP. The rendered
+PDFs are held on disk under a one-time token; n8n reads the manifest, then
+fetches and sends each PDF to Telegram as its own document, PACED so
+Telegram's per-chat flood limit is never tripped (see the n8n workflow's
+"Loop Over Reports" + "Pace" nodes). Held files auto-expire on the render
+sweep even if a pick-up never happens.
 
 Pending uploads live in a temp dir, one slot per chat, auto-expire after TTL.
 """
-import os, tempfile, shutil, json, re, time, logging, zipfile, fcntl
+import os, tempfile, shutil, json, re, time, logging, fcntl
 from contextlib import contextmanager
 from flask import Flask, request, send_file, jsonify
 
@@ -69,18 +74,29 @@ def _chat_key(chat):
     # only allow digits / minus (telegram chat ids) to build a safe filename
     return re.sub(r'[^0-9\-]', '', str(chat))
 
-_FA_DIGITS = str.maketrans('0123456789', '۰۱۲۳۴۵۶۷۸۹')
+class BatchTooLarge(Exception):
+    """A file carries more respondents than MAX_BATCH. Not a fault — the
+    message is bilingual and gets relayed straight into the chat."""
 
-def _render_response(in_path, name, date=''):
-    # under RENDER_DIR so _sweep() reclaims it if a worker dies mid-render
-    # (e.g. gunicorn timeout) and call_on_close never runs — a killed batch
-    # would otherwise strand up to ~90 MB of PDFs in /tmp forever
+def _stash_reports(in_path, name, date=''):
+    """Render every respondent to its OWN PDF, hold the PDFs on disk under a
+    one-time token dir, and return a JSON-able manifest. n8n then fetches each
+    one from /file/<token>/<idx> and sends it as its own Telegram document.
+
+    Returns {ok, count, token, files:[{idx, filename, overall, dominant,
+    archetype}, ...]}. Raises BatchTooLarge for an over-cap file; any other
+    failure removes the token dir and re-raises.
+
+    The dir lives under RENDER_DIR — the same place a killed render leaves its
+    scratch — so _sweep() reclaims it on the TTL even when a pick-up never
+    happens (n8n stopped, the batch was forwarded elsewhere, a worker died).
+    """
     td = tempfile.mkdtemp(dir=RENDER_DIR)
+    token = os.path.basename(td)
     try:
         datas = svc.score_workbook_all(in_path)
         if len(datas) > MAX_BATCH:
-            # bilingual: the bot relays this text straight into the chat
-            raise ValueError(
+            raise BatchTooLarge(
                 f'این فایل {len(datas)} نفر دارد؛ حداکثر {MAX_BATCH} نفر در '
                 f'هر فایل — لطفاً فایل را تقسیم کنید. '
                 f'(batch of {len(datas)} exceeds the limit of {MAX_BATCH})')
@@ -92,34 +108,20 @@ def _render_response(in_path, name, date=''):
     except Exception:
         shutil.rmtree(td, ignore_errors=True)
         raise
-    if len(reports) == 1:
-        out_path, person, data = reports[0]
-        fh = open(out_path, 'rb')
-        # delete the tree NOW: the open fd keeps the bytes streamable (POSIX)
-        # and is closed by the WSGI file wrapper when the response ends.
-        # (response.call_on_close never fires for send_file responses — the
-        # WSGI iterable is the bare file wrapper, not the Response — so a
-        # delete-on-close callback silently leaks the dir instead.)
-        shutil.rmtree(td, ignore_errors=True)
-        resp = send_file(fh, mimetype='application/pdf',
-                         as_attachment=True,
-                         download_name=svc.safe_pdf_name(person))
-        resp.headers['X-Overall'] = str(data['overall_score'])
-        resp.headers['X-Dominant'] = data['dominant']
-        resp.headers['X-Archetype'] = data['archetype']
-    else:
-        zip_path = os.path.join(td, 'reports.zip')
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
-            for pdf_path, _person, _data in reports:
-                z.write(pdf_path, arcname=os.path.basename(pdf_path))
-        fh = open(zip_path, 'rb')
-        shutil.rmtree(td, ignore_errors=True)
-        fa_count = str(len(reports)).translate(_FA_DIGITS)
-        resp = send_file(fh, mimetype='application/zip',
-                         as_attachment=True,
-                         download_name=f'گزارش-انرژی-{fa_count}-نفر.zip')
-    resp.headers['X-Count'] = str(len(reports))
-    return resp
+    # render_reports already writes safe, collision-deduped filenames into td,
+    # so the on-disk basename doubles as the Telegram document name; the numeric
+    # idx (not the Persian name) is what the pick-up URL carries.
+    files, manifest = [], []
+    for idx, (pdf_path, _person, data) in enumerate(reports):
+        fname = os.path.basename(pdf_path)
+        files.append({'idx': idx, 'filename': fname,
+                      'overall': data['overall_score'],
+                      'dominant': data['dominant'],
+                      'archetype': data['archetype']})
+        manifest.append({'idx': idx, 'filename': fname, 'file': fname})
+    with open(os.path.join(td, 'manifest.json'), 'w', encoding='utf-8') as mf:
+        json.dump(manifest, mf, ensure_ascii=False)
+    return {'ok': True, 'count': len(files), 'token': token, 'files': files}
 
 def _sweep():
     now = time.time()
@@ -163,9 +165,13 @@ def report():
         in_path = os.path.join(td, 'in.xlsx')
         f.save(in_path)
         try:
-            resp = _render_response(in_path, name)
-            log.info('report ok file=%s', f.filename)
-            return resp
+            payload = _stash_reports(in_path, name)
+            log.info('report ok file=%s count=%d', f.filename, payload['count'])
+            return jsonify(payload)
+        except BatchTooLarge as e:
+            # a user error, not a fault: 200 so n8n parses the message cleanly
+            log.info('report over-cap file=%s: %s', f.filename, e)
+            return jsonify(ok=False, error=str(e)), 200
         except Exception as e:
             log.exception('report failed file=%s', f.filename)
             return jsonify(ok=False, error=str(e)), 500
@@ -206,14 +212,42 @@ def render():
     if not os.path.exists(path):
         return jsonify(ok=False, error='no pending file for this chat'), 404
     try:
-        resp = _render_response(path, name)
+        payload = _stash_reports(path, name)
+    except BatchTooLarge as e:
+        return jsonify(ok=False, error=str(e)), 200
     except Exception as e:
         log.exception('render failed chat=%s', chat)
         return jsonify(ok=False, error=str(e)), 500
     finally:
         try: os.remove(path)
         except OSError: pass
-    return resp
+    return jsonify(payload)
+
+@app.route('/file/<token>/<int:idx>', methods=['GET'])
+def fetch_file(token, idx):
+    """Pick up one rendered PDF by index. n8n calls this once per report in
+    the manifest, pacing the calls so Telegram never flood-limits the chat.
+    The token dir is left in place for _sweep() to reclaim on the TTL, so a
+    retry or a re-send can pick the same file up again within the window."""
+    if not _auth_ok():
+        return jsonify(ok=False, error='unauthorized'), 401
+    # token is a mkdtemp basename; strip anything that isn't in that alphabet
+    # so it can never climb out of RENDER_DIR
+    safe_token = re.sub(r'[^A-Za-z0-9_]', '', str(token))
+    d = os.path.join(RENDER_DIR, safe_token)
+    manifest_path = os.path.join(d, 'manifest.json')
+    if not safe_token or not os.path.isdir(d) or not os.path.exists(manifest_path):
+        return jsonify(ok=False, error='not found or expired'), 404
+    with open(manifest_path, encoding='utf-8') as mf:
+        manifest = json.load(mf)
+    entry = next((m for m in manifest if m.get('idx') == idx), None)
+    if not entry:
+        return jsonify(ok=False, error='no such report'), 404
+    fpath = os.path.join(d, os.path.basename(entry['file']))
+    if not os.path.exists(fpath):
+        return jsonify(ok=False, error='report gone'), 404
+    return send_file(fpath, mimetype='application/pdf', as_attachment=True,
+                     download_name=entry['filename'])
 
 if __name__ == '__main__':
     log.info('chakra starting on port %s', os.environ.get('PORT', '8099'))
